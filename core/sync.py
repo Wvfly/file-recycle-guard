@@ -640,9 +640,7 @@ class IncrementalScanner:
         dirs_skipped_by_mtime = 0
         batch_start = time.time()
 
-        # 批量缓存写入收集器（减少 COMMIT）
-        pending_cache_sets = []   # [(path_hash, full_path, mtime, size)]
-        pending_cache_deletes = []  # [path_hash]
+        # 批量缓存写入已通过模块级 _pcache_buffer 攒批实现（见 L474-490）
 
         dirs_processed_in_page = 0
 
