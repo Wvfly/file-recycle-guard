@@ -1,0 +1,60 @@
+# 共享文件回收站守护程序配置
+
+# 要监控的共享文件夹路径（在服务器本机上的路径）
+watch_paths:
+  - "E:\\tmp\\share"
+
+# 备份镜像目录（请确保有足够磁盘空间）
+backup_dir: "E:\\tmp\\share_bak"
+
+# 回收站目录（删除的文件会移动到这里）
+recycle_dir: "E:\\tmp\\share_ryc"
+
+# 回收站保留天数（超过天数自动清理）
+retention_days: 30
+
+# 排除的文件模式（支持通配符）
+exclude_patterns:
+  - "~$*"          # Office 临时文件
+  - "*.tmp"         # 临时文件
+  - "*.lock"        # 锁文件
+  - "Thumbs.db"     # 缩略图缓存
+
+# 排除的文件夹名称
+exclude_dirs:
+  - "$RECYCLE.BIN"
+  - "System Volume Information"
+  - "__pycache__"
+  - ".git"
+
+# 日志配置
+log:
+  level: "INFO"     # DEBUG / INFO / WARNING / ERROR
+  file: "logs\\recycle_guard.log"
+  # 日志保留天数
+  max_days: 90
+
+# Web 管理界面
+web:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8088
+  # 强烈建议设置密码：服务监听 0.0.0.0 时，未认证的用户可清空回收站
+  # username: "admin"
+  # password: "admin123"
+
+# 备份镜像清理：定期清理备份目录中源目录已不存在的文件
+# 这些是之前的备份，源文件已被正确删除并移入回收站
+mirror_cleanup:
+  enabled: true
+  # 清理间隔（秒）
+  interval: 3600
+  # 备份文件中超过此时间未在源目录出现，才清理（秒）
+  grace_period: 300
+
+# 定期同步：主动扫描监控目录并备份变更
+# 解决 watchdog 无法可靠检测 SMB 网络共享变更的问题
+sync:
+  enabled: true
+  # 扫描间隔（秒），建议 30-60 秒
+  interval: 30

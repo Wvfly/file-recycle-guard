@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>文件回收站管理</title>
+    <style>
+        :root {
+            --bg: #1a1a2e;
+            --card-bg: #16213e;
+            --border: #2a3a5e;
+            --text: #e0e0e0;
+            --text-secondary: #a0a0b0;
+            --accent: #4fc3f7;
+            --danger: #ef5350;
+            --success: #66bb6a;
+            --warning: #ffa726;
+            --hover: #1e3050;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, "Microsoft YaHei", sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+        }
+
+        .header {
+            background: var(--card-bg);
+            border-bottom: 1px solid var(--border);
+            padding: 16px 32px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .header h1 { font-size: 20px; color: var(--accent); }
+        .header-right { display: flex; gap: 12px; align-items: center; }
+
+        .container { max-width: 1200px; margin: 0 auto; padding: 24px 32px; }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .stat-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+        }
+        .stat-card .label { font-size: 13px; color: var(--text-secondary); }
+        .stat-card .value { font-size: 28px; font-weight: 700; color: var(--accent); margin-top: 4px; }
+        .stat-card .sub { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
+
+        .toolbar {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 16px;
+            align-items: center;
+        }
+        .search-box {
+            flex: 1;
+            padding: 8px 16px;
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text);
+            font-size: 14px;
+            outline: none;
+        }
+        .search-box:focus { border-color: var(--accent); }
+
+        .btn {
+            padding: 8px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: opacity 0.2s;
+        }
+        .btn:hover { opacity: 0.85; }
+        .btn-danger { background: var(--danger); color: white; }
+        .btn-warning { background: var(--warning); color: #1a1a2e; }
+        .btn-restore { background: var(--success); color: white; padding: 4px 12px; font-size: 12px; }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        .file-list {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .file-item {
+            display: flex;
+            align-items: center;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border);
+            transition: background 0.15s;
+        }
+        .file-item:last-child { border-bottom: none; }
+        .file-item:hover { background: var(--hover); }
+
+        .file-icon {
+            width: 36px; height: 36px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 18px;
+            flex-shrink: 0;
+            margin-right: 12px;
+        }
+        .file-info { flex: 1; min-width: 0; }
+        .file-name {
+            font-size: 14px;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .file-path {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .file-meta {
+            display: flex;
+            gap: 20px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            flex-shrink: 0;
+            margin-right: 12px;
+        }
+        .file-meta span { white-space: nowrap; }
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-secondary);
+        }
+        .empty-state .icon { font-size: 48px; margin-bottom: 16px; }
+
+        .toast {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 12px 24px;
+            border-radius: 6px;
+            color: white;
+            font-size: 14px;
+            z-index: 1000;
+            animation: slideIn 0.3s ease;
+            pointer-events: none;
+        }
+        .toast-success { background: var(--success); }
+        .toast-error { background: var(--danger); }
+        @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+        .confirm-overlay {
+            position: fixed; inset: 0;
+            background: rgba(0,0,0,0.6);
+            display: flex; align-items: center; justify-content: center;
+            z-index: 999;
+        }
+        .confirm-box {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            max-width: 400px;
+            text-align: center;
+        }
+        .confirm-box p { margin-bottom: 20px; font-size: 15px; }
+        .confirm-box .actions { display: flex; gap: 12px; justify-content: center; }
+
+        .footer {
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 12px;
+            padding: 20px;
+            margin-top: 40px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🗑️ 共享文件回收站</h1>
+        <div class="header-right">
+            <span id="lastRefresh" style="color: var(--text-secondary); font-size: 12px;"></span>
+            <button class="btn" style="background: var(--border); color: var(--text);" onclick="refresh()">刷新</button>
+            <button class="btn btn-danger" onclick="showEmptyConfirm()">清空回收站</button>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="stats">
+            <div class="stat-card">
+                <div class="label">回收站文件数</div>
+                <div class="value" id="statCount">{{ total_count }}</div>
+                <div class="sub">已删除并被保护的文件</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">占用空间</div>
+                <div class="value" id="statSize">{{ total_size }}</div>
+                <div class="sub" id="statBackup"></div>
+            </div>
+            <div class="stat-card">
+                <div class="label">保留期限</div>
+                <div class="value" style="font-size: 22px;">30 天</div>
+                <div class="sub">超期自动清理</div>
+            </div>
+        </div>
+
+        <div class="toolbar">
+            <input type="text" class="search-box" placeholder="搜索文件名或路径..." oninput="filterFiles()" id="searchInput">
+            <span style="font-size: 13px; color: var(--text-secondary);">
+                共 <strong id="fileCount">{{ total_count }}</strong> 个文件
+            </span>
+        </div>
+
+        <div class="file-list" id="fileList">
+            {% if files %}
+                {% for f in files %}
+                <div class="file-item" data-path="{{ f.recycle_path }}" data-search="{{ f.relative_path }} {{ f.original_path }}">
+                    <div class="file-icon">
+                        {% if f.is_directory %}📁{% elif f.relative_path.endswith('.xlsx') or f.relative_path.endswith('.xls') %}📊
+                        {% elif f.relative_path.endswith('.docx') or f.relative_path.endswith('.doc') %}📝
+                        {% elif f.relative_path.endswith('.pdf') %}📕
+                        {% elif f.relative_path.endswith('.jpg') or f.relative_path.endswith('.png') %}🖼️
+                        {% else %}📄{% endif %}
+                    </div>
+                    <div class="file-info">
+                        <div class="file-name">{{ f.relative_path.split('/')[-1].split('\\')[-1] }}</div>
+                        <div class="file-path">{{ f.relative_path }}</div>
+                    </div>
+                    <div class="file-meta">
+                        <span>{{ f.file_size_fmt }}</span>
+                        <span>{{ f.deletion_time_fmt }}</span>
+                        <span>{{ f.ago_fmt }}</span>
+                    </div>
+                    <button class="btn btn-restore" onclick="restoreFile('{{ f.recycle_path }}')" {% if not f.exists %}disabled{% endif %}>
+                        {% if f.exists %}恢复{% else %}已清理{% endif %}
+                    </button>
+                </div>
+                {% endfor %}
+            {% else %}
+                <div class="empty-state">
+                    <div class="icon">📭</div>
+                    <div>回收站为空，暂无已删除文件</div>
+                </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="footer">
+        文件回收站守护程序 · 所有远程删除操作都会被记录并可恢复
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="toast" style="display:none;"></div>
+
+    <!-- 确认对话框 -->
+    <div id="confirmOverlay" class="confirm-overlay" style="display:none;">
+        <div class="confirm-box">
+            <p>确定要清空回收站吗？<br><strong>此操作不可逆！</strong></p>
+            <div class="actions">
+                <button class="btn" style="background: var(--border); color: var(--text);" onclick="hideConfirm()">取消</button>
+                <button class="btn btn-danger" onclick="emptyRecycle()">确认清空</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function showToast(msg, type) {
+            var t = document.getElementById('toast');
+            t.textContent = msg;
+            t.className = 'toast toast-' + type;
+            t.style.display = 'block';
+            setTimeout(function() { t.style.display = 'none'; }, 3000);
+        }
+
+        function showEmptyConfirm() {
+            document.getElementById('confirmOverlay').style.display = 'flex';
+        }
+        function hideConfirm() {
+            document.getElementById('confirmOverlay').style.display = 'none';
+        }
+
+        function restoreFile(path) {
+            var btn = event.target;
+            btn.disabled = true;
+            btn.textContent = '恢复中...';
+
+            fetch('/api/restore', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path: path})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    showToast('文件已恢复', 'success');
+                    setTimeout(refresh, 500);
+                } else {
+                    showToast('恢复失败: ' + (data.error || '未知错误'), 'error');
+                    btn.disabled = false;
+                    btn.textContent = '恢复';
+                }
+            })
+            .catch(err => {
+                showToast('请求失败: ' + err, 'error');
+                btn.disabled = false;
+                btn.textContent = '恢复';
+            });
+        }
+
+        function emptyRecycle() {
+            hideConfirm();
+            fetch('/api/empty', {method: 'POST'})
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    showToast('回收站已清空', 'success');
+                    setTimeout(refresh, 500);
+                } else {
+                    showToast('清空失败', 'error');
+                }
+            });
+        }
+
+        function filterFiles() {
+            var query = document.getElementById('searchInput').value.toLowerCase();
+            var items = document.querySelectorAll('.file-item');
+            var count = 0;
+            items.forEach(function(item) {
+                var search = item.getAttribute('data-search') || '';
+                if (!query || search.toLowerCase().indexOf(query) >= 0) {
+                    item.style.display = '';
+                    count++;
+                } else {
+                    item.style.display = 'none';
+                }
+            });
+            document.getElementById('fileCount').textContent = count;
+        }
+
+        function refresh() {
+            location.reload();
+        }
+
+        // 自动刷新
+        setInterval(function() {
+            var now = new Date();
+            document.getElementById('lastRefresh').textContent =
+                '上次刷新: ' + now.toLocaleTimeString('zh-CN');
+        }, 1000);
+
+        // 加载统计
+        fetch('/api/stats')
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('statCount').textContent = data.recycled_count;
+                document.getElementById('statSize').textContent = data.recycled_formatted;
+                document.getElementById('statBackup').textContent =
+                    '备份: ' + data.backup_formatted + ' | 回收站: ' + data.recycle_formatted;
+            });
+    </script>
+</body>
+</html>

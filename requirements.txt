@@ -1,0 +1,7 @@
+watchdog>=3.0.0
+pyyaml>=6.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+jinja2>=3.0.0
+# Windows 服务模式需要（service.py）
+pywin32>=306
