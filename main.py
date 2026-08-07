@@ -17,7 +17,7 @@ import time
 import argparse
 import threading
 
-from core.config import load_config, Config
+from core.config import load_config, Config, get_exe_dir
 from core.logger import setup_logger
 from core.database import init_database
 from core.watcher import start_watcher
@@ -162,8 +162,9 @@ def main():
 
     args = parser.parse_args()
 
-    # 切换到脚本所在目录
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # 定位程序所在目录（支持 onefile 打包模式）
+    # Nuitka onefile 下 sys.executable 指向临时目录，必须用 sys.argv[0]
+    script_dir = get_exe_dir()
     os.chdir(script_dir)
 
     pid_file = "recycle_guard.pid"

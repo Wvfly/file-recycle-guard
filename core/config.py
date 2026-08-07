@@ -3,6 +3,7 @@
 """
 
 import os
+import sys
 import yaml
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field
@@ -86,8 +87,55 @@ class Config:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
 
 
+def get_exe_dir() -> str:
+    """获取程序所在目录
+
+    使用 sys.argv[0] 定位 exe 所在目录。
+    开发模式下就是项目根目录。
+    """
+    return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+
+def _resolve_config_path(config_path: str) -> str:
+    """解析配置文件路径
+
+    优先级：
+    1. 绝对路径（直接使用）
+    2. exe 所在目录（打包模式下 config.yaml 与 exe 同目录）
+    3. CWD 相对路径
+    4. 脚本所在目录（开发模式）
+    """
+    # 绝对路径直接返回
+    if os.path.isabs(config_path) and os.path.exists(config_path):
+        return config_path
+    # 1. exe 所在目录
+    try:
+        exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        candidate = os.path.join(exe_dir, os.path.basename(config_path))
+        if os.path.exists(candidate):
+            return candidate
+    except Exception:
+        pass
+    # 2. CWD 相对路径
+    cwd_candidate = os.path.abspath(config_path)
+    if os.path.exists(cwd_candidate):
+        return cwd_candidate
+    # 3. 脚本所在目录（开发模式）
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_dir = os.path.dirname(os.path.dirname(script_dir))
+        candidate = os.path.join(project_dir, os.path.basename(config_path))
+        if os.path.exists(candidate):
+            return candidate
+    except Exception:
+        pass
+    # 4. 返回原路径（由调用方处理不存在的情况）
+    return config_path
+
+
 def load_config(config_path: str = "config.yaml") -> Config:
     """从 YAML 文件加载配置"""
+    config_path = _resolve_config_path(config_path)
     if not os.path.exists(config_path):
         print(f"配置文件 {config_path} 不存在，使用默认配置")
         return Config()
@@ -117,7 +165,7 @@ def load_config(config_path: str = "config.yaml") -> Config:
         if "file" in log_raw:
             config.log.file = log_raw["file"]
         if "max_days" in log_raw:
-            config.log.max_days = log_raw["max_days"]
+            config.log.max_days = raw["log"]["max_days"]
 
     if "web" in raw:
         web_raw = raw["web"]
