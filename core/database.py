@@ -57,7 +57,7 @@ class Database:
             "password": password,
             "database": database,
             "charset": "utf8mb4",
-            "autocommit": True,
+            "autocommit": False,
         }
         self._local = threading.local()
         self._lock = threading.Lock()
@@ -65,9 +65,29 @@ class Database:
     # ── 连接管理 ────────────────────────────────────────────
 
     def _get_conn(self):
-        """获取当前线程的数据库连接（惰性创建 + 断线重连）"""
+        """获取当前线程的数据库连接（惰性创建 + 健康检查 + 断线重连）"""
         conn = getattr(self._local, "conn", None)
-        if conn is None or not conn.open:
+        conn_time = getattr(self._local, "conn_time", 0)
+        # 连接健康检查：ping 检测 + 最大空闲时间回收
+        if conn is not None:
+            if not conn.open:
+                conn = None
+            elif time.time() - conn_time > 3600:  # 1小时回收
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+            else:
+                try:
+                    conn.ping()
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = None
+        if conn is None:
             try:
                 conn = pymysql.connect(**self._config)
             except pymysql.err.OperationalError:
@@ -75,6 +95,7 @@ class Database:
                 time.sleep(0.5)
                 conn = pymysql.connect(**self._config)
             self._local.conn = conn
+            self._local.conn_time = time.time()
         return conn
 
     def _retry_on_disconnect(self, func, *args, **kwargs):
@@ -263,6 +284,7 @@ class Database:
                     backup_time = VALUES(backup_time)
             """, (watch_root, rel_path, file_hash, file_size, mtime,
                   source_path, backup_time, ph))
+        conn.commit()
 
     def batch_upsert_backup_meta(self, items: List[Dict]):
         """
@@ -301,6 +323,7 @@ class Database:
             )
             with conn.cursor() as cur:
                 cur.execute(sql, values)
+        conn.commit()
 
     def delete_backup_meta(self, watch_root: str, rel_path: str):
         """删除备份元信息"""
@@ -311,6 +334,7 @@ class Database:
                 "DELETE FROM backup_meta WHERE path_hash=%s",
                 (ph,)
             )
+        conn.commit()
 
     def list_all_backup_meta(self) -> List[Dict]:
         """列出所有备份元信息（用于清理模块）
@@ -395,6 +419,7 @@ class Database:
             """, (recycle_path, original_path, relative_path, watch_root,
                   int(is_directory), deletion_time, deletion_time_str,
                   file_size, file_hash, original_mtime))
+        conn.commit()
 
     def get_recycle_meta(self, recycle_path: str) -> Optional[Dict]:
         """查询单条回收站元信息"""
@@ -461,6 +486,7 @@ class Database:
                 "DELETE FROM recycle_meta WHERE recycle_path=%s",
                 (recycle_path,)
             )
+        conn.commit()
 
     def delete_expired_recycle_meta(self, cutoff: float) -> List[Dict]:
         """删除过期的回收站元信息，返回被删除的记录列表"""
@@ -478,4 +504,5 @@ class Database:
                     "DELETE FROM recycle_meta WHERE deletion_time < %s",
                     (cutoff,)
                 )
+            conn.commit()
         return rows

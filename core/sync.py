@@ -21,7 +21,7 @@ import threading
 import fnmatch
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Tuple, Optional, List, Set
+from typing import Dict, Tuple, Optional, List, Set, Any
 from collections import OrderedDict
 from .config import Config
 from .backup import backup_file
@@ -273,9 +273,22 @@ class DirectoryTreeCache:
         """
         使用 os.walk() 重建目录树（仅在首次或定期重建时调用）。
         同时将目录的当前 mtime 一并存储。
+
+        原子切换策略：先构建到临时表，完成后原子交换，
+        避免重建期间新目录丢失的一致性窗口。
         """
         conn = self._get_conn()
-        conn.execute("DELETE FROM dir_tree")
+
+        # 创建临时表
+        conn.execute("DROP TABLE IF EXISTS dir_tree_new")
+        conn.execute("""
+            CREATE TABLE dir_tree_new (
+                path TEXT PRIMARY KEY,
+                mtime REAL NOT NULL DEFAULT 0,
+                parent TEXT,
+                depth INTEGER NOT NULL DEFAULT 0
+            )
+        """)
 
         for watch_path in config.watch_paths:
             if not os.path.exists(watch_path):
@@ -287,7 +300,7 @@ class DirectoryTreeCache:
             root_st = _safe_stat(watch_path)
             root_mtime = root_st.st_mtime if root_st else 0.0
             conn.execute(
-                "INSERT OR REPLACE INTO dir_tree (path, mtime, parent, depth) "
+                "INSERT INTO dir_tree_new (path, mtime, parent, depth) "
                 "VALUES (?, ?, ?, ?)",
                 (watch_path, root_mtime, None, 0)
             )
@@ -302,11 +315,23 @@ class DirectoryTreeCache:
                     dir_st = _safe_stat(dir_path)
                     dir_mtime = dir_st.st_mtime if dir_st else 0.0
                     conn.execute(
-                        "INSERT INTO dir_tree (path, mtime, parent, depth) "
+                        "INSERT INTO dir_tree_new (path, mtime, parent, depth) "
                         "VALUES (?, ?, ?, ?)",
                         (dir_path, dir_mtime, root, parent_depth + 1)
                     )
 
+        # 原子切换：删除旧表，重命名新表
+        conn.execute("DROP TABLE dir_tree")
+        conn.execute("ALTER TABLE dir_tree_new RENAME TO dir_tree")
+        # 重建索引
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_parent
+            ON dir_tree(parent)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_depth
+            ON dir_tree(depth)
+        """)
         conn.commit()
 
     def count(self) -> int:
@@ -446,6 +471,24 @@ _memory_cache: Optional[MemoryLRUCache] = None
 _dir_cache: Optional[DirectoryTreeCache] = None
 _cache_init_lock = threading.Lock()
 
+# ── SQLite 持久化缓存写入缓冲（攒批替代逐条 commit） ───────────
+_pcache_buffer_lock = threading.Lock()
+_pcache_buffer: List[Tuple[str, str, float, int]] = []
+_PCACHE_BUFFER_THRESHOLD = 100
+
+
+def _flush_pcache_buffer(pcache: 'PersistentFileCache'):
+    """刷新 SQLite 持久化缓存写入缓冲区（批量 set_batch）"""
+    with _pcache_buffer_lock:
+        if not _pcache_buffer:
+            return
+        items = _pcache_buffer[:]
+        _pcache_buffer.clear()
+    try:
+        pcache.set_batch(items)
+    except Exception:
+        pass
+
 
 def _get_caches(cache_dir: str) -> Tuple[PersistentFileCache,
                                           MemoryLRUCache,
@@ -506,6 +549,9 @@ class IncrementalScanner:
     4. 待处理跟踪：防止同一文件重复提交备份
     5. 批量 SQLite 写入：缓存更新合并为一次 COMMIT
     """
+
+    # 线程池队列上限：防止突发大量文件变更时任务积压
+    _MAX_POOL_QUEUE = 2000
 
     def __init__(self, backup_workers: int = 8):
         self._cursor: int = 0
@@ -688,6 +734,11 @@ class IncrementalScanner:
                     if backed_up >= batch_files:
                         break
 
+                    # 队列积压保护：防止突发大量文件变更时任务积压
+                    with self._in_flight_cond:
+                        if len(self._in_flight) >= self._MAX_POOL_QUEUE:
+                            break
+
                     # 跳过正在备份中的文件（防止重复提交）
                     with self._in_flight_cond:
                         if full_path in self._in_flight:
@@ -695,14 +746,25 @@ class IncrementalScanner:
                         self._in_flight.add(full_path)
 
                     def _on_backup_done(future, _fp=full_path,
-                                        _ck=cache_key, _fs=file_stat):
+                                        _ck=cache_key, _fs=file_stat,
+                                        _pc=pcache):
                         try:
                             result = future.result()
                             if result == "backed_up":
                                 mcache.set(_ck, _fs)
-                                pcache.set(
-                                    _ck, _fp, _fs[0], _fs[1]
-                                )
+                                items = None
+                                with _pcache_buffer_lock:
+                                    _pcache_buffer.append(
+                                        (_ck, _fp, _fs[0], _fs[1])
+                                    )
+                                    if len(_pcache_buffer) >= _PCACHE_BUFFER_THRESHOLD:
+                                        items = _pcache_buffer[:]
+                                        _pcache_buffer.clear()
+                                if items is not None:
+                                    try:
+                                        _pc.set_batch(items)
+                                    except Exception:
+                                        pass
                             elif result in ("dirty", "source_gone"):
                                 mcache.delete(_ck)
                                 pcache.delete(_ck)
@@ -740,6 +802,9 @@ class IncrementalScanner:
             logger.debug(
                 f"层次化扫描跳过 {dirs_skipped_by_mtime} 个未变化目录"
             )
+
+        # 刷新残余 SQLite 缓存缓冲
+        _flush_pcache_buffer(pcache)
 
         return backed_up, skipped, scanned
 

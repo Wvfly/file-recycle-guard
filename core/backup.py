@@ -23,16 +23,15 @@ import fnmatch
 import hashlib
 import time
 import threading
-from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Set
 from .config import Config
 from .database import get_db
 
-# per-file 锁（LRU 淘汰，防止亿级文件 OOM）
-_FILE_LOCKS_MAX = 200_000
-_file_locks: OrderedDict = OrderedDict()
-_file_locks_lock = threading.Lock()
+# per-file 锁（固定大小锁池，消除 LRU 淘汰正确性风险）
+# 4096 个锁 + 8 workers → 碰撞概率极低，碰撞仅导致串行化（不影响正确性）
+_FILE_LOCK_POOL_SIZE = 4096
+_file_locks: list = [threading.Lock() for _ in range(_FILE_LOCK_POOL_SIZE)]
 
 # 目录创建锁（防止 os.makedirs 并发冲突）
 _makedirs_lock = threading.Lock()
@@ -41,18 +40,31 @@ _makedirs_lock = threading.Lock()
 _active_backups: set = set()
 _active_backups_cond = threading.Condition()
 
+# ── MySQL 元信息写入缓冲（攒批替代逐条提交） ───────────────────
+_meta_buffer_lock = threading.Lock()
+_meta_buffer: list = []
+_META_BUFFER_THRESHOLD = 50
+
+
+def _flush_meta_buffer():
+    """刷新 MySQL 元信息写入缓冲区（批量 upsert）"""
+    with _meta_buffer_lock:
+        if not _meta_buffer:
+            return
+        items = _meta_buffer[:]
+        _meta_buffer.clear()
+    try:
+        db = get_db()
+        if db is not None:
+            db.batch_upsert_backup_meta(items)
+    except Exception:
+        pass
+
 
 def _get_file_lock(path: str) -> threading.Lock:
-    """获取指定文件的锁（LRU 惰性创建，超出上限自动淘汰）"""
+    """获取指定文件的锁（基于路径哈希选槽，固定大小锁池无淘汰风险）"""
     norm = os.path.normcase(os.path.abspath(path))
-    with _file_locks_lock:
-        if norm in _file_locks:
-            _file_locks.move_to_end(norm)
-        else:
-            _file_locks[norm] = threading.Lock()
-            while len(_file_locks) > _FILE_LOCKS_MAX:
-                _file_locks.popitem(last=False)
-        return _file_locks[norm]
+    return _file_locks[hash(norm) % _FILE_LOCK_POOL_SIZE]
 
 
 def _should_exclude(relative_path: str, config: Config) -> bool:
@@ -171,15 +183,25 @@ def _write_meta(backup_path: str, abs_src_path: str,
 
         db = get_db()
         if db is not None:
-            db.upsert_backup_meta(
-                watch_root=watch_root,
-                rel_path=relative,
-                file_hash=file_hash,
-                file_size=stat.st_size,
-                mtime=stat.st_mtime,
-                source_path=abs_src_path,
-                backup_time=time.time(),
-            )
+            items = None
+            with _meta_buffer_lock:
+                _meta_buffer.append({
+                    "watch_root": watch_root,
+                    "rel_path": relative,
+                    "file_hash": file_hash,
+                    "file_size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "source_path": abs_src_path,
+                    "backup_time": time.time(),
+                })
+                if len(_meta_buffer) >= _META_BUFFER_THRESHOLD:
+                    items = _meta_buffer[:]
+                    _meta_buffer.clear()
+            if items is not None:
+                try:
+                    db.batch_upsert_backup_meta(items)
+                except Exception:
+                    pass  # 元信息写入失败不阻塞主流程
         else:
             # 回退：写入 .meta 文件（兼容旧模式）
             meta_path = backup_path + ".meta"
@@ -456,6 +478,9 @@ def backup_full_tree(config: Config, logger, max_workers: int = 8) -> int:
                 except Exception as e:
                     failed += 1
                     logger.error(f"初始备份异常: {e}")
+
+        # 刷新残余元信息缓冲
+        _flush_meta_buffer()
 
     logger.info(
         f"初始备份完成: 发现 {total_found} 个文件, "
