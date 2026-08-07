@@ -84,50 +84,52 @@ def create_app(config: Config, logger) -> FastAPI:
 
     @app.get("/")
     async def index(request: Request):
-        files = list_recycled_files(config)
-        total_size = sum(f.get("file_size", 0) for f in files)
-        # 预处理文件数据，在 Python 端格式化，避免向模板传递 callable
-        for f in files:
-            f["file_size_fmt"] = _format_size(f.get("file_size", 0))
-            f["deletion_time_fmt"] = _format_time(f.get("deletion_time", 0))
-            f["ago_fmt"] = _seconds_ago(f.get("deletion_time", 0))
-        context = {
-            "files": files,
-            "total_count": len(files),
-            "total_size": _format_size(total_size),
-        }
+        """主页 - 文件列表通过 AJAX 分页加载"""
         return templates.TemplateResponse(
-            request=request, name="index.html", context=context
+            request=request, name="index.html", context={}
         )
 
     # ── API 路由 ────────────────────────────────────────────
 
     @app.get("/api/files")
-    async def api_files(search: str = ""):
-        """获取回收站文件列表（JSON API）"""
+    async def api_files(search: str = "", page: int = 1, page_size: int = 20):
+        """获取回收站文件列表（JSON API，支持分页）"""
         search_lower = search.lower()
-        files = list_recycled_files(config)
+        all_files = list_recycled_files(config)
 
         if search_lower:
-            files = [
-                f for f in files
+            all_files = [
+                f for f in all_files
                 if search_lower in f.get("relative_path", "").lower()
                 or search_lower in f.get("original_path", "").lower()
             ]
 
+        total = len(all_files)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = max(1, min(page, total_pages))
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_files = all_files[start:end]
+
         return {
-            "total": len(files),
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
             "files": [
                 {
                     "relative_path": f.get("relative_path", ""),
+                    "recycle_path": f.get("recycle_path", ""),
                     "deletion_time": f.get("deletion_time_str", ""),
                     "deletion_ts": f.get("deletion_time", 0),
                     "file_size": f.get("file_size", 0),
+                    "file_size_fmt": _format_size(f.get("file_size", 0)),
+                    "deletion_time_fmt": _format_time(f.get("deletion_time", 0)),
+                    "ago_fmt": _seconds_ago(f.get("deletion_time", 0)),
                     "exists": f.get("exists", False),
                     "is_directory": f.get("is_directory", False),
-                    "ago": _seconds_ago(f.get("deletion_time", 0)),
                 }
-                for f in files
+                for f in page_files
             ],
         }
 

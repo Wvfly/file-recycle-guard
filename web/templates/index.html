@@ -73,6 +73,18 @@
         }
         .search-box:focus { border-color: var(--accent); }
 
+        .page-size-select {
+            padding: 8px 12px;
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text);
+            font-size: 13px;
+            outline: none;
+            cursor: pointer;
+        }
+        .page-size-select:focus { border-color: var(--accent); }
+
         .btn {
             padding: 8px 20px;
             border: none;
@@ -142,6 +154,74 @@
         }
         .empty-state .icon { font-size: 48px; margin-bottom: 16px; }
 
+        /* 分页控件 */
+        .pagination {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 0;
+            margin-top: 8px;
+        }
+        .pagination-info {
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        .pagination-controls {
+            display: flex;
+            gap: 4px;
+            align-items: center;
+        }
+        .page-btn {
+            min-width: 34px;
+            height: 34px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text);
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+            padding: 0 8px;
+        }
+        .page-btn:hover:not(:disabled):not(.active) {
+            background: var(--hover);
+            border-color: var(--accent);
+        }
+        .page-btn.active {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: var(--bg);
+            font-weight: 600;
+        }
+        .page-btn:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+        }
+        .page-ellipsis {
+            color: var(--text-secondary);
+            font-size: 13px;
+            padding: 0 4px;
+        }
+
+        .loading-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--text-secondary);
+        }
+        .loading-spinner {
+            display: inline-block;
+            width: 24px; height: 24px;
+            border: 3px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-bottom: 12px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
         .toast {
             position: fixed;
             top: 20px;
@@ -198,12 +278,12 @@
         <div class="stats">
             <div class="stat-card">
                 <div class="label">回收站文件数</div>
-                <div class="value" id="statCount">{{ total_count }}</div>
+                <div class="value" id="statCount">-</div>
                 <div class="sub">已删除并被保护的文件</div>
             </div>
             <div class="stat-card">
                 <div class="label">占用空间</div>
-                <div class="value" id="statSize">{{ total_size }}</div>
+                <div class="value" id="statSize">-</div>
                 <div class="sub" id="statBackup"></div>
             </div>
             <div class="stat-card">
@@ -214,43 +294,28 @@
         </div>
 
         <div class="toolbar">
-            <input type="text" class="search-box" placeholder="搜索文件名或路径..." oninput="filterFiles()" id="searchInput">
+            <input type="text" class="search-box" placeholder="搜索文件名或路径..." id="searchInput">
+            <select class="page-size-select" id="pageSizeSelect" title="每页显示数量">
+                <option value="10">10 条/页</option>
+                <option value="20" selected>20 条/页</option>
+                <option value="50">50 条/页</option>
+                <option value="100">100 条/页</option>
+            </select>
             <span style="font-size: 13px; color: var(--text-secondary);">
-                共 <strong id="fileCount">{{ total_count }}</strong> 个文件
+                共 <strong id="fileCount">0</strong> 个文件
             </span>
         </div>
 
         <div class="file-list" id="fileList">
-            {% if files %}
-                {% for f in files %}
-                <div class="file-item" data-path="{{ f.recycle_path }}" data-search="{{ f.relative_path }} {{ f.original_path }}">
-                    <div class="file-icon">
-                        {% if f.is_directory %}📁{% elif f.relative_path.endswith('.xlsx') or f.relative_path.endswith('.xls') %}📊
-                        {% elif f.relative_path.endswith('.docx') or f.relative_path.endswith('.doc') %}📝
-                        {% elif f.relative_path.endswith('.pdf') %}📕
-                        {% elif f.relative_path.endswith('.jpg') or f.relative_path.endswith('.png') %}🖼️
-                        {% else %}📄{% endif %}
-                    </div>
-                    <div class="file-info">
-                        <div class="file-name">{{ f.relative_path.split('/')[-1].split('\\')[-1] }}</div>
-                        <div class="file-path">{{ f.relative_path }}</div>
-                    </div>
-                    <div class="file-meta">
-                        <span>{{ f.file_size_fmt }}</span>
-                        <span>{{ f.deletion_time_fmt }}</span>
-                        <span>{{ f.ago_fmt }}</span>
-                    </div>
-                    <button class="btn btn-restore" onclick="restoreFile('{{ f.recycle_path }}', this)" {% if not f.exists %}disabled{% endif %}>
-                        {% if f.exists %}恢复{% else %}已清理{% endif %}
-                    </button>
-                </div>
-                {% endfor %}
-            {% else %}
-                <div class="empty-state">
-                    <div class="icon">📭</div>
-                    <div>回收站为空，暂无已删除文件</div>
-                </div>
-            {% endif %}
+            <div class="loading-state">
+                <div class="loading-spinner"></div>
+                <div>加载中...</div>
+            </div>
+        </div>
+
+        <div class="pagination" id="pagination" style="display:none;">
+            <div class="pagination-info" id="paginationInfo"></div>
+            <div class="pagination-controls" id="paginationControls"></div>
         </div>
     </div>
 
@@ -273,6 +338,13 @@
     </div>
 
     <script>
+        // ── 分页状态 ──────────────────────────────────────────
+        var currentPage = 1;
+        var pageSize = 20;
+        var totalPages = 1;
+        var searchTimer = null;
+
+        // ── 工具函数 ──────────────────────────────────────────
         function showToast(msg, type) {
             var t = document.getElementById('toast');
             t.textContent = msg;
@@ -288,6 +360,159 @@
             document.getElementById('confirmOverlay').style.display = 'none';
         }
 
+        function getFileIcon(f) {
+            if (f.is_directory) return '📁';
+            var p = f.relative_path.toLowerCase();
+            if (p.endsWith('.xlsx') || p.endsWith('.xls')) return '📊';
+            if (p.endsWith('.docx') || p.endsWith('.doc')) return '📝';
+            if (p.endsWith('.pdf')) return '📕';
+            if (p.endsWith('.jpg') || p.endsWith('.png') || p.endsWith('.jpeg')) return '🖼️';
+            return '📄';
+        }
+
+        function getFileName(f) {
+            var parts = f.relative_path.replace(/\\/g, '/').split('/');
+            return parts[parts.length - 1] || f.relative_path;
+        }
+
+        // ── 加载文件列表 ──────────────────────────────────────
+        function loadFiles() {
+            var search = document.getElementById('searchInput').value;
+            var params = new URLSearchParams({
+                page: currentPage,
+                page_size: pageSize,
+                search: search
+            });
+
+            document.getElementById('fileList').innerHTML =
+                '<div class="loading-state"><div class="loading-spinner"></div><div>加载中...</div></div>';
+
+            fetch('/api/files?' + params)
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    totalPages = data.total_pages;
+                    currentPage = data.page;
+                    renderFileList(data.files);
+                    renderPagination(data.total, data.page, data.total_pages);
+                    document.getElementById('fileCount').textContent = data.total;
+                })
+                .catch(function(err) {
+                    document.getElementById('fileList').innerHTML =
+                        '<div class="empty-state"><div class="icon">⚠️</div><div>加载失败: ' + err + '</div></div>';
+                });
+        }
+
+        // ── 渲染文件列表 ──────────────────────────────────────
+        function renderFileList(files) {
+            var container = document.getElementById('fileList');
+            if (!files || files.length === 0) {
+                container.innerHTML = '<div class="empty-state"><div class="icon">📭</div><div>回收站为空，暂无已删除文件</div></div>';
+                return;
+            }
+
+            var html = '';
+            for (var i = 0; i < files.length; i++) {
+                var f = files[i];
+                var name = getFileName(f);
+                html += '<div class="file-item" data-search="' + escapeAttr(f.relative_path) + '">'
+                    + '<div class="file-icon">' + getFileIcon(f) + '</div>'
+                    + '<div class="file-info">'
+                    + '<div class="file-name" title="' + escapeAttr(name) + '">' + escapeHtml(name) + '</div>'
+                    + '<div class="file-path" title="' + escapeAttr(f.relative_path) + '">' + escapeHtml(f.relative_path) + '</div>'
+                    + '</div>'
+                    + '<div class="file-meta">'
+                    + '<span>' + f.file_size_fmt + '</span>'
+                    + '<span>' + f.deletion_time_fmt + '</span>'
+                    + '<span>' + f.ago_fmt + '</span>'
+                    + '</div>'
+                    + '<button class="btn btn-restore" onclick="restoreFile(\'' + escapeAttr(f.recycle_path) + '\', this)"'
+                    + (f.exists ? '' : ' disabled') + '>'
+                    + (f.exists ? '恢复' : '已清理')
+                    + '</button>'
+                    + '</div>';
+            }
+            container.innerHTML = html;
+        }
+
+        function escapeHtml(str) {
+            var div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
+        function escapeAttr(str) {
+            return str.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        // ── 渲染分页控件 ──────────────────────────────────────
+        function renderPagination(total, page, tp) {
+            var paginationEl = document.getElementById('pagination');
+            var infoEl = document.getElementById('paginationInfo');
+            var controlsEl = document.getElementById('paginationControls');
+
+            if (total === 0) {
+                paginationEl.style.display = 'none';
+                return;
+            }
+            paginationEl.style.display = 'flex';
+
+            var start = (page - 1) * pageSize + 1;
+            var end = Math.min(page * pageSize, total);
+            infoEl.textContent = '显示 ' + start + '-' + end + ' 条，共 ' + total + ' 条';
+
+            var html = '';
+            // 上一页
+            html += '<button class="page-btn" onclick="goToPage(' + (page - 1) + ')"' + (page <= 1 ? ' disabled' : '') + '>‹ 上一页</button>';
+
+            // 页码按钮（最多显示 7 个页码，含省略号）
+            var pages = buildPageNumbers(page, tp);
+            for (var i = 0; i < pages.length; i++) {
+                if (pages[i] === '...') {
+                    html += '<span class="page-ellipsis">…</span>';
+                } else {
+                    html += '<button class="page-btn' + (pages[i] === page ? ' active' : '') + '" onclick="goToPage(' + pages[i] + ')">' + pages[i] + '</button>';
+                }
+            }
+
+            // 下一页
+            html += '<button class="page-btn" onclick="goToPage(' + (page + 1) + ')"' + (page >= tp ? ' disabled' : '') + '>下一页 ›</button>';
+
+            controlsEl.innerHTML = html;
+        }
+
+        /**
+         * 构建页码数组，例如: [1, '...', 4, 5, 6, 7, 8, '...', 20]
+         * 始终显示首尾页、当前页前后2页
+         */
+        function buildPageNumbers(current, total) {
+            if (total <= 7) {
+                var arr = [];
+                for (var i = 1; i <= total; i++) arr.push(i);
+                return arr;
+            }
+
+            var pages = [];
+            var left = Math.max(2, current - 2);
+            var right = Math.min(total - 1, current + 2);
+
+            pages.push(1);
+            if (left > 2) pages.push('...');
+            for (var j = left; j <= right; j++) pages.push(j);
+            if (right < total - 1) pages.push('...');
+            if (total > 1) pages.push(total);
+
+            return pages;
+        }
+
+        function goToPage(page) {
+            if (page < 1 || page > totalPages || page === currentPage) return;
+            currentPage = page;
+            loadFiles();
+            // 滚动到列表顶部
+            document.getElementById('fileList').scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+
+        // ── 恢复文件 ──────────────────────────────────────────
         function restoreFile(path, btn) {
             btn.disabled = true;
             btn.textContent = '恢复中...';
@@ -301,7 +526,7 @@
             .then(function(data) {
                 if (data.success) {
                     showToast('文件已恢复', 'success');
-                    setTimeout(refresh, 500);
+                    setTimeout(function() { loadFiles(); loadStats(); }, 500);
                 } else {
                     showToast('恢复失败: ' + (data.error || '未知错误'), 'error');
                     btn.disabled = false;
@@ -315,56 +540,70 @@
             });
         }
 
+        // ── 清空回收站 ────────────────────────────────────────
         function emptyRecycle() {
             hideConfirm();
             fetch('/api/empty', {method: 'POST'})
-            .then(r => r.json())
-            .then(data => {
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
                 if (data.success) {
                     showToast('回收站已清空', 'success');
-                    setTimeout(refresh, 500);
+                    currentPage = 1;
+                    setTimeout(function() { loadFiles(); loadStats(); }, 500);
                 } else {
                     showToast('清空失败', 'error');
                 }
             });
         }
 
-        function filterFiles() {
-            var query = document.getElementById('searchInput').value.toLowerCase();
-            var items = document.querySelectorAll('.file-item');
-            var count = 0;
-            items.forEach(function(item) {
-                var search = item.getAttribute('data-search') || '';
-                if (!query || search.toLowerCase().indexOf(query) >= 0) {
-                    item.style.display = '';
-                    count++;
-                } else {
-                    item.style.display = 'none';
-                }
-            });
-            document.getElementById('fileCount').textContent = count;
+        // ── 加载统计 ──────────────────────────────────────────
+        function loadStats() {
+            fetch('/api/stats')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    document.getElementById('statCount').textContent = data.recycled_count;
+                    document.getElementById('statSize').textContent = data.recycled_formatted;
+                    document.getElementById('statBackup').textContent =
+                        '备份: ' + data.backup_formatted + ' | 回收站: ' + data.recycle_formatted;
+                });
         }
 
+        // ── 刷新 ──────────────────────────────────────────────
         function refresh() {
-            location.reload();
+            loadFiles();
+            loadStats();
+            var now = new Date();
+            document.getElementById('lastRefresh').textContent =
+                '上次刷新: ' + now.toLocaleTimeString('zh-CN');
         }
 
-        // 自动刷新
+        // ── 事件绑定 ──────────────────────────────────────────
+        // 搜索防抖
+        document.getElementById('searchInput').addEventListener('input', function() {
+            clearTimeout(searchTimer);
+            searchTimer = setTimeout(function() {
+                currentPage = 1;
+                loadFiles();
+            }, 300);
+        });
+
+        // 每页条数切换
+        document.getElementById('pageSizeSelect').addEventListener('change', function() {
+            pageSize = parseInt(this.value);
+            currentPage = 1;
+            loadFiles();
+        });
+
+        // ── 初始化 ────────────────────────────────────────────
+        loadFiles();
+        loadStats();
+
+        // 自动刷新时间显示
         setInterval(function() {
             var now = new Date();
             document.getElementById('lastRefresh').textContent =
                 '上次刷新: ' + now.toLocaleTimeString('zh-CN');
-        }, 1000);
-
-        // 加载统计
-        fetch('/api/stats')
-            .then(r => r.json())
-            .then(data => {
-                document.getElementById('statCount').textContent = data.recycled_count;
-                document.getElementById('statSize').textContent = data.recycled_formatted;
-                document.getElementById('statBackup').textContent =
-                    '备份: ' + data.backup_formatted + ' | 回收站: ' + data.recycle_formatted;
-            });
+        }, 60000);
     </script>
 </body>
 </html>
