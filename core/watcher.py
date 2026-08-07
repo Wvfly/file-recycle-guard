@@ -14,7 +14,10 @@ from .backup import backup_file, backup_full_tree
 from .recycler import move_to_recycle
 
 # 删除事件确认延迟（秒）：等待这么久后文件仍未重建，才视为真删除
-_DELETE_CONFIRM_DELAY = 0.5
+_DELETE_CONFIRM_DELAY = 2.0
+
+# 等待备份完成的最大时间（秒）
+_BACKUP_WAIT_TIMEOUT = 5
 
 
 class RecycleGuardHandler(FileSystemEventHandler):
@@ -56,6 +59,11 @@ class RecycleGuardHandler(FileSystemEventHandler):
                 return True
         self._recent_events.append((now, key))
         return False
+
+    def _is_pending_delete(self, src_path: str) -> bool:
+        """检查该路径是否已在待删除队列中（避免重复加入）"""
+        with self._pending_lock:
+            return any(p == src_path for p, _, _ in self._pending_deletes)
 
     def _is_under(self, path: str, base: str) -> bool:
         """判断 path 是否位于 base 目录内（归一化比较，避免前缀误匹配）"""
@@ -114,14 +122,21 @@ class RecycleGuardHandler(FileSystemEventHandler):
         if self._should_exclude(event.src_path):
             return
 
+        # 去重：避免同一文件的多个删除事件重复处理
+        if self._is_duplicate(event.src_path, "deleted"):
+            return
+
         self.logger.info(f"文件/目录被删除: {event.src_path} (目录: {event.is_directory})")
 
         # 延迟处理：因为有些程序（如 Office）会先删除再创建临时文件
         # 加入待确认队列，由工作线程在延迟后确认文件未被重建再回收
         with self._pending_lock:
-            self._pending_deletes.append(
-                (event.src_path, event.is_directory, time.time())
-            )
+            # 检查是否已在队列中，避免重复
+            already_pending = any(p == event.src_path for p, _, _ in self._pending_deletes)
+            if not already_pending:
+                self._pending_deletes.append(
+                    (event.src_path, event.is_directory, time.time())
+                )
 
     def _delete_worker_loop(self):
         """后台工作线程：处理到期的待确认删除事件"""
@@ -151,8 +166,28 @@ class RecycleGuardHandler(FileSystemEventHandler):
                 backup_file(src_path, self.config, self.logger)
             return
 
-        # 确认是真删除，移入回收站
-        move_to_recycle(src_path, is_directory, self.config, self.logger)
+        # 确认真删除：等待正在进行的备份完成，再移入回收站
+        # 避免备份还没做完就把空备份移入回收站
+        self._wait_for_backup(src_path)
+        result = move_to_recycle(src_path, is_directory, self.config, self.logger)
+
+        # 如果第一次失败（备份不存在），再重试一次
+        if result is None and not is_directory:
+            self.logger.debug(f"首次移入回收站失败，等待后重试: {src_path}")
+            time.sleep(2)
+            if not os.path.exists(src_path):  # 确认文件没有重建
+                move_to_recycle(src_path, is_directory, self.config, self.logger)
+
+    def _wait_for_backup(self, src_path: str):
+        """等待正在进行的备份操作完成"""
+        from .backup import _backup_lock
+        if _backup_lock.locked():
+            self.logger.debug(f"等待备份操作完成: {src_path}")
+            acquired = _backup_lock.acquire(timeout=_BACKUP_WAIT_TIMEOUT)
+            if acquired:
+                _backup_lock.release()
+                # 额外等待让文件系统操作完成
+                time.sleep(0.5)
 
     def on_moved(self, event: FileSystemEvent):
         """处理重命名/移动事件"""
@@ -174,9 +209,11 @@ class RecycleGuardHandler(FileSystemEventHandler):
             return
         self.logger.info(f"文件被移出监控目录（视为删除）: {event.src_path}")
         with self._pending_lock:
-            self._pending_deletes.append(
-                (event.src_path, event.is_directory, time.time())
-            )
+            already_pending = any(p == event.src_path for p, _, _ in self._pending_deletes)
+            if not already_pending:
+                self._pending_deletes.append(
+                    (event.src_path, event.is_directory, time.time())
+                )
 
 
 def start_watcher(config: Config, logger):

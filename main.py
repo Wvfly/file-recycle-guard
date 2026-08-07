@@ -19,6 +19,7 @@ import threading
 
 from core.config import load_config, Config
 from core.logger import setup_logger
+from core.database import init_database
 from core.watcher import start_watcher
 from core.cleanup import start_cleanup
 from core.sync import start_sync
@@ -60,6 +61,21 @@ class RecycleGuard:
             self.logger.info(f"备份目录: {self.config.backup_dir}")
             self.logger.info(f"回收站目录: {self.config.recycle_dir}")
             self.logger.info(f"保留天数: {self.config.retention_days}")
+
+            # 初始化数据库
+            try:
+                db_config = self.config.database
+                init_database(
+                    host=db_config.host,
+                    port=db_config.port,
+                    user=db_config.user,
+                    password=db_config.password,
+                    database=db_config.database,
+                )
+                self.logger.info(f"数据库已初始化: {db_config.host}:{db_config.port}/{db_config.database}")
+            except Exception as e:
+                self.logger.error(f"数据库初始化失败: {e}")
+                self.logger.warning("将使用文件方式存储元信息（兼容模式）")
 
             # 确保目录存在
             for d in [self.config.backup_dir, self.config.recycle_dir]:
@@ -195,6 +211,20 @@ def main():
         config = load_config(args.config)
         logger = setup_logger(config)
         logger.info("仅启动 Web 管理界面...")
+        # 初始化数据库
+        try:
+            db_config = config.database
+            init_database(
+                host=db_config.host,
+                port=db_config.port,
+                user=db_config.user,
+                password=db_config.password,
+                database=db_config.database,
+            )
+            logger.info(f"数据库已初始化: {db_config.host}:{db_config.port}/{db_config.database}")
+        except Exception as e:
+            logger.error(f"数据库初始化失败: {e}")
+            logger.warning("将使用文件方式存储元信息（兼容模式）")
         thread = start_web(config, logger)
         if thread:
             try:

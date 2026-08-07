@@ -240,7 +240,7 @@
                         <span>{{ f.deletion_time_fmt }}</span>
                         <span>{{ f.ago_fmt }}</span>
                     </div>
-                    <button class="btn btn-restore" onclick="restoreFile('{{ f.recycle_path }}')" {% if not f.exists %}disabled{% endif %}>
+                    <button class="btn btn-restore" onclick="restoreFile('{{ f.recycle_path }}', this)" {% if not f.exists %}disabled{% endif %}>
                         {% if f.exists %}恢复{% else %}已清理{% endif %}
                     </button>
                 </div>
@@ -288,8 +288,7 @@
             document.getElementById('confirmOverlay').style.display = 'none';
         }
 
-        function restoreFile(path) {
-            var btn = event.target;
+        function restoreFile(path, btn) {
             btn.disabled = true;
             btn.textContent = '恢复中...';
 
@@ -298,8 +297,8 @@
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({path: path})
             })
-            .then(r => r.json())
-            .then(data => {
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
                 if (data.success) {
                     showToast('文件已恢复', 'success');
                     setTimeout(refresh, 500);
@@ -309,7 +308,7 @@
                     btn.textContent = '恢复';
                 }
             })
-            .catch(err => {
+            .catch(function(err) {
                 showToast('请求失败: ' + err, 'error');
                 btn.disabled = false;
                 btn.textContent = '恢复';

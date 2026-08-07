@@ -58,3 +58,12 @@ sync:
   enabled: true
   # 扫描间隔（秒），建议 30-60 秒
   interval: 30
+
+# MySQL 数据库配置 - 存储备份元信息和回收站元信息
+# 替代原来的 .meta 和 .recycle.json 文件
+database:
+  host: "127.0.0.1"
+  port: 3306
+  user: "root"
+  password: "123456"
+  database: "file_recycle_guard"

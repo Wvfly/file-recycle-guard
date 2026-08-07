@@ -1,11 +1,7 @@
-/recycle_guard.pid
 /.idea/.gitignore
 /.idea/file-recycle-guard.iml
 /.idea/misc.xml
 /.idea/modules.xml
 /.idea/inspectionProfiles/profiles_settings.xml
 /.idea/inspectionProfiles/Project_Default.xml
-/logs/recycle_guard.log
-/logs/recycle_guard.log.2026-08-06
-/core/recycler.py
 /.idea/vcs.xml

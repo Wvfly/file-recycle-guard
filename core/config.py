@@ -39,6 +39,16 @@ class SyncConfig:
 
 
 @dataclass
+class DatabaseConfig:
+    """MySQL 数据库配置 - 存储备份和回收站元信息"""
+    host: str = "127.0.0.1"
+    port: int = 3306
+    user: str = "root"
+    password: str = "123456"
+    database: str = "file_recycle_guard"
+
+
+@dataclass
 class Config:
     watch_paths: List[str] = field(default_factory=list)
 
@@ -73,6 +83,7 @@ class Config:
     web: WebConfig = field(default_factory=WebConfig)
     mirror_cleanup: MirrorCleanupConfig = field(default_factory=MirrorCleanupConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
+    database: DatabaseConfig = field(default_factory=DatabaseConfig)
 
 
 def load_config(config_path: str = "config.yaml") -> Config:
@@ -136,5 +147,18 @@ def load_config(config_path: str = "config.yaml") -> Config:
             config.sync.enabled = sync_raw["enabled"]
         if "interval" in sync_raw:
             config.sync.interval = sync_raw["interval"]
+
+    if "database" in raw:
+        db_raw = raw["database"]
+        if "host" in db_raw:
+            config.database.host = db_raw["host"]
+        if "port" in db_raw:
+            config.database.port = db_raw["port"]
+        if "user" in db_raw:
+            config.database.user = db_raw["user"]
+        if "password" in db_raw:
+            config.database.password = db_raw["password"]
+        if "database" in db_raw:
+            config.database.database = db_raw["database"]
 
     return config

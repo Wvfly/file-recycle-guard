@@ -18,6 +18,7 @@ import time
 import threading
 from typing import List, Optional, Set
 from .config import Config
+from .database import get_db
 
 # 全局锁，防止文件操作冲突
 _backup_lock = threading.Lock()
@@ -58,8 +59,18 @@ def _compute_file_hash(file_path: str) -> Optional[str]:
         return None
 
 
-def _compute_hash_for_backup(backup_path: str) -> Optional[str]:
-    """计算备份中已有文件的哈希"""
+def _compute_hash_for_backup(backup_path: str, watch_root: str = "",
+                             relative: str = "") -> Optional[str]:
+    """计算备份中已有文件的哈希（优先从数据库读取）"""
+    db = get_db()
+    if db is not None:
+        try:
+            meta = db.get_backup_meta(watch_root, relative)
+            if meta and meta.get("file_hash"):
+                return meta["file_hash"]
+        except Exception:
+            pass
+    # 回退：从 .meta 文件读取（兼容旧数据）
     meta_path = backup_path + ".meta"
     try:
         if os.path.exists(meta_path):
@@ -72,8 +83,24 @@ def _compute_hash_for_backup(backup_path: str) -> Optional[str]:
     return None
 
 
-def _read_meta(backup_path: str) -> dict:
-    """读取备份文件的元信息"""
+def _read_meta(backup_path: str, watch_root: str = "",
+               relative: str = "") -> dict:
+    """读取备份文件的元信息（优先从数据库读取）"""
+    db = get_db()
+    if db is not None:
+        try:
+            meta = db.get_backup_meta(watch_root, relative)
+            if meta:
+                return {
+                    "hash": meta.get("file_hash", ""),
+                    "size": str(meta.get("file_size", -1)),
+                    "mtime": str(meta.get("mtime", -1)),
+                    "source": meta.get("source_path", ""),
+                    "backup_time": str(meta.get("backup_time", 0)),
+                }
+        except Exception:
+            pass
+    # 回退：从 .meta 文件读取（兼容旧数据）
     meta_path = backup_path + ".meta"
     result = {}
     try:
@@ -90,19 +117,34 @@ def _read_meta(backup_path: str) -> dict:
 
 
 def _write_meta(backup_path: str, abs_src_path: str,
-                file_hash: Optional[str] = None):
-    """写入备份文件的元信息"""
-    meta_path = backup_path + ".meta"
+                file_hash: Optional[str] = None,
+                watch_root: str = "", relative: str = ""):
+    """写入备份文件的元信息（优先写入数据库）"""
     try:
         stat = os.stat(abs_src_path)
         if file_hash is None:
             file_hash = _compute_file_hash(abs_src_path) or "unknown"
-        with open(meta_path, "w", encoding="utf-8") as f:
-            f.write(f"hash:{file_hash}\n")
-            f.write(f"size:{stat.st_size}\n")
-            f.write(f"mtime:{stat.st_mtime}\n")
-            f.write(f"source:{abs_src_path}\n")
-            f.write(f"backup_time:{time.time()}\n")
+
+        db = get_db()
+        if db is not None:
+            db.upsert_backup_meta(
+                watch_root=watch_root,
+                rel_path=relative,
+                file_hash=file_hash,
+                file_size=stat.st_size,
+                mtime=stat.st_mtime,
+                source_path=abs_src_path,
+                backup_time=time.time(),
+            )
+        else:
+            # 回退：写入 .meta 文件（兼容旧模式）
+            meta_path = backup_path + ".meta"
+            with open(meta_path, "w", encoding="utf-8") as f:
+                f.write(f"hash:{file_hash}\n")
+                f.write(f"size:{stat.st_size}\n")
+                f.write(f"mtime:{stat.st_mtime}\n")
+                f.write(f"source:{abs_src_path}\n")
+                f.write(f"backup_time:{time.time()}\n")
     except (IOError, OSError) as e:
         pass  # 元信息写入失败不阻塞主流程
 
@@ -147,7 +189,7 @@ def backup_file(abs_src_path: str, config: Config, logger) -> str:
         return "skipped"
 
     if os.path.exists(backup_path):
-        meta = _read_meta(backup_path)
+        meta = _read_meta(backup_path, watch_root, relative)
         try:
             bak_size = int(meta.get("size", -1))
             bak_mtime = float(meta.get("mtime", -1))
@@ -165,7 +207,7 @@ def backup_file(abs_src_path: str, config: Config, logger) -> str:
         try:
             # 如果备份已存在，比较哈希
             if os.path.exists(backup_path):
-                backup_hash = _compute_hash_for_backup(backup_path)
+                backup_hash = _compute_hash_for_backup(backup_path, watch_root, relative)
                 if backup_hash and backup_hash == src_hash:
                     return "skipped"
 
@@ -178,7 +220,7 @@ def backup_file(abs_src_path: str, config: Config, logger) -> str:
             os.makedirs(backup_dir, exist_ok=True)
 
             shutil.copy2(abs_src_path, backup_path)
-            _write_meta(backup_path, abs_src_path, src_hash)
+            _write_meta(backup_path, abs_src_path, src_hash, watch_root, relative)
 
             # ── 竞态校验：备份后重新 stat 源文件 ──────────────
             # 检测备份期间是否有并发写入或删除

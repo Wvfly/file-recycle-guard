@@ -146,6 +146,9 @@ def create_app(config: Config, logger) -> FastAPI:
                 content={"success": False, "error": "请指定要恢复的文件"},
             )
 
+        # recycle_path 可能是正斜杠（前端传来），统一转为系统路径分隔符
+        recycle_path = recycle_path.replace("/", os.sep).replace("\\", os.sep)
+
         # recycle_path 是绝对路径，转为相对路径（跨盘符时 relpath 会报错）
         try:
             rel_path = os.path.relpath(recycle_path, config.recycle_dir)
