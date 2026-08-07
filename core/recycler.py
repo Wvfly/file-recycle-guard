@@ -7,7 +7,7 @@ import shutil
 import json
 import time
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from .config import Config
 from .database import get_db
 
@@ -275,7 +275,9 @@ def restore_from_recycle(recycle_rel_path: str, config: Config,
 
 
 def list_recycled_files(config: Config) -> List[Dict]:
-    """列出回收站中所有已删除的文件"""
+    """列出回收站中所有已删除的文件（全量，兼容旧调用）
+    注意：大量数据下应使用 list_recycled_files_paged()
+    """
     results = []
     db = get_db()
 
@@ -286,21 +288,18 @@ def list_recycled_files(config: Config) -> List[Dict]:
             for meta in db_records:
                 recycle_path = meta.get("recycle_path", "")
                 recycle_full = os.path.join(config.recycle_dir, recycle_path)
-                if not os.path.exists(recycle_full):
-                    # 文件已被手动清理
-                    results.append({
-                        **meta,
-                        "recycle_path": recycle_full.replace(os.sep, "/"),
-                        "exists": False,
-                    })
-                else:
-                    stat = os.stat(recycle_full)
-                    results.append({
-                        **meta,
-                        "recycle_path": recycle_full.replace(os.sep, "/"),
-                        "exists": True,
-                        "current_size": stat.st_size,
-                    })
+                exists = os.path.exists(recycle_full)
+                entry = {
+                    **meta,
+                    "recycle_path": recycle_full.replace(os.sep, "/"),
+                    "exists": exists,
+                }
+                if exists:
+                    try:
+                        entry["current_size"] = os.stat(recycle_full).st_size
+                    except OSError:
+                        pass
+                results.append(entry)
             return results
         except Exception:
             pass  # 回退到文件方式
@@ -320,25 +319,71 @@ def list_recycled_files(config: Config) -> List[Dict]:
                     continue
 
                 recycle_file = meta_path[:-len(".recycle.json")]
-                if not os.path.exists(recycle_file):
-                    # 文件已被手动清理
-                    results.append({
-                        **meta,
-                        "recycle_path": recycle_file.replace(os.sep, "/"),
-                        "exists": False,
-                    })
-                else:
-                    stat = os.stat(recycle_file)
-                    results.append({
-                        **meta,
-                        "recycle_path": recycle_file.replace(os.sep, "/"),
-                        "exists": True,
-                        "current_size": stat.st_size,
-                    })
+                exists = os.path.exists(recycle_file)
+                entry = {
+                    **meta,
+                    "recycle_path": recycle_file.replace(os.sep, "/"),
+                    "exists": exists,
+                }
+                if exists:
+                    try:
+                        entry["current_size"] = os.stat(recycle_file).st_size
+                    except OSError:
+                        pass
+                results.append(entry)
 
     # 按删除时间倒序
     results.sort(key=lambda x: x.get("deletion_time", 0), reverse=True)
     return results
+
+
+def list_recycled_files_paged(config: Config, page: int = 1,
+                              page_size: int = 20,
+                              search: str = "") -> Tuple[List[Dict], int]:
+    """
+    分页查询回收站文件列表（后端分页，避免全量加载）。
+
+    返回 (files, total_count) 元组。
+    files 中每条已包含 exists 和 current_size 信息。
+    """
+    db = get_db()
+
+    if db is not None:
+        try:
+            rows, total = db.list_recycle_meta_paged(page, page_size, search)
+            results = []
+            for meta in rows:
+                recycle_path = meta.get("recycle_path", "")
+                recycle_full = os.path.join(config.recycle_dir, recycle_path)
+                exists = os.path.exists(recycle_full)
+                entry = {
+                    **meta,
+                    "recycle_path": recycle_full.replace(os.sep, "/"),
+                    "exists": exists,
+                }
+                if exists:
+                    try:
+                        entry["current_size"] = os.stat(recycle_full).st_size
+                    except OSError:
+                        pass
+                results.append(entry)
+            return results, total
+        except Exception:
+            pass  # 回退到全量方式
+
+    # 回退：全量加载后手动分页（兼容无数据库或旧数据）
+    all_files = list_recycled_files(config)
+    if search:
+        search_lower = search.lower()
+        all_files = [
+            f for f in all_files
+            if search_lower in f.get("relative_path", "").lower()
+            or search_lower in f.get("original_path", "").lower()
+        ]
+    total = len(all_files)
+    start = (page - 1) * page_size
+    end = start + page_size
+    return all_files[start:end], total
 
 
 def cleanup_expired(config: Config, logger) -> int:

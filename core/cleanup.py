@@ -35,49 +35,48 @@ def _cleanup_orphaned_backups(config: Config, logger):
     grace = config.mirror_cleanup.grace_period
     db = get_db()
 
-    # 如果数据库可用，优先从数据库获取备份元信息
+    # 如果数据库可用，优先从数据库获取备份元信息（分批遍历，避免 OOM）
     if db is not None:
         try:
-            all_backup_meta = db.list_all_backup_meta()
-            for meta in all_backup_meta:
-                rel_path = meta.get("rel_path", "")
-                watch_root = meta.get("watch_root", "")
-                backup_path = os.path.join(config.backup_dir, rel_path)
+            # 使用流式分批遍历，每批 5000 条
+            for batch in db.iter_backup_meta_batch(batch_size=5000):
+                for meta in batch:
+                    rel_path = meta.get("rel_path", "")
+                    watch_root = meta.get("watch_root", "")
+                    backup_path = os.path.join(config.backup_dir, rel_path)
 
-                key = os.path.normcase(backup_path)
+                    key = os.path.normcase(backup_path)
 
-                if _source_exists(rel_path, config):
-                    _missing_since.pop(key, None)  # 源文件还在，重置记录
-                    continue
+                    if _source_exists(rel_path, config):
+                        _missing_since.pop(key, None)  # 源文件还在，重置记录
+                        continue
 
-                # 源文件已删除，从首次发现消失时起算宽限期
-                now = time.time()
-                first_missing = _missing_since.setdefault(key, now)
-                if now - first_missing < grace:
-                    continue  # 还在宽限期内
+                    # 源文件已删除，从首次发现消失时起算宽限期
+                    now = time.time()
+                    first_missing = _missing_since.setdefault(key, now)
+                    if now - first_missing < grace:
+                        continue  # 还在宽限期内
 
-                # 清理：移入回收站而非直接删除，保留数据安全
-                try:
-                    src_path_for_recycle = os.path.join(watch_root, rel_path)
-                    recycle_path = move_to_recycle(
-                        src_path_for_recycle, False, config, logger
-                    )
-                    if recycle_path:
-                        cleaned += 1
-                        logger.debug(f"孤立备份已移入回收站: {rel_path}")
-                        # 同时删除数据库中的元信息
-                        db.delete_backup_meta(watch_root, rel_path)
-                    else:
-                        # move_to_recycle 返回 None，直接清理残留
-                        if os.path.exists(backup_path):
-                            os.remove(backup_path)
-                        db.delete_backup_meta(watch_root, rel_path)
-                        cleaned += 1
-                        logger.debug(f"清理孤立备份: {rel_path}")
-                except OSError as e:
-                    logger.error(f"清理孤立备份失败: {e}")
-                finally:
-                    _missing_since.pop(key, None)
+                    # 清理：移入回收站而非直接删除，保留数据安全
+                    try:
+                        src_path_for_recycle = os.path.join(watch_root, rel_path)
+                        recycle_path = move_to_recycle(
+                            src_path_for_recycle, False, config, logger
+                        )
+                        if recycle_path:
+                            cleaned += 1
+                            logger.debug(f"孤立备份已移入回收站: {rel_path}")
+                            db.delete_backup_meta(watch_root, rel_path)
+                        else:
+                            if os.path.exists(backup_path):
+                                os.remove(backup_path)
+                            db.delete_backup_meta(watch_root, rel_path)
+                            cleaned += 1
+                            logger.debug(f"清理孤立备份: {rel_path}")
+                    except OSError as e:
+                        logger.error(f"清理孤立备份失败: {e}")
+                    finally:
+                        _missing_since.pop(key, None)
 
             if cleaned > 0:
                 logger.info(f"已清理 {cleaned} 个孤立备份文件")

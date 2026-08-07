@@ -8,6 +8,13 @@
     - "dirty"        : 备份完成但源文件在备份期间被并发修改，缓存不应更新
     - "source_gone"  : 备份完成但源文件已删除，备份已移入回收站
     - "failed"       : 备份失败
+
+性能优化（亿级场景）：
+- per-file 锁替代全局锁，允许多文件并行复制（大幅提升 SMB 吞吐）
+- per-file 锁采用 LRU 淘汰，亿级文件不会 OOM
+- 目录创建使用独立锁，避免 os.makedirs 并发冲突
+- backup_full_tree 流式遍历，不一次性加载所有文件路径到内存
+- 活跃备份跟踪机制，替代全局锁供 watcher 等待
 """
 
 import os
@@ -16,12 +23,36 @@ import fnmatch
 import hashlib
 import time
 import threading
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Set
 from .config import Config
 from .database import get_db
 
-# 全局锁，防止文件操作冲突
-_backup_lock = threading.Lock()
+# per-file 锁（LRU 淘汰，防止亿级文件 OOM）
+_FILE_LOCKS_MAX = 200_000
+_file_locks: OrderedDict = OrderedDict()
+_file_locks_lock = threading.Lock()
+
+# 目录创建锁（防止 os.makedirs 并发冲突）
+_makedirs_lock = threading.Lock()
+
+# 活跃备份跟踪（替代全局 _backup_lock，供 watcher 等待）
+_active_backups: set = set()
+_active_backups_cond = threading.Condition()
+
+
+def _get_file_lock(path: str) -> threading.Lock:
+    """获取指定文件的锁（LRU 惰性创建，超出上限自动淘汰）"""
+    norm = os.path.normcase(os.path.abspath(path))
+    with _file_locks_lock:
+        if norm in _file_locks:
+            _file_locks.move_to_end(norm)
+        else:
+            _file_locks[norm] = threading.Lock()
+            while len(_file_locks) > _FILE_LOCKS_MAX:
+                _file_locks.popitem(last=False)
+        return _file_locks[norm]
 
 
 def _should_exclude(relative_path: str, config: Config) -> bool:
@@ -45,6 +76,17 @@ def _should_exclude(relative_path: str, config: Config) -> bool:
 def _get_relative_path(abs_path: str, watch_root: str) -> str:
     """获取相对于监控根目录的路径"""
     return os.path.relpath(abs_path, watch_root)
+
+
+def _safe_stat(path: str):
+    """
+    安全获取文件 stat 信息。
+    对于 SMB 网络共享上不支持 stat 的文件（WinError 50），静默返回 None。
+    """
+    try:
+        return os.stat(path)
+    except OSError:
+        return None
 
 
 def _compute_file_hash(file_path: str) -> Optional[str]:
@@ -121,7 +163,9 @@ def _write_meta(backup_path: str, abs_src_path: str,
                 watch_root: str = "", relative: str = ""):
     """写入备份文件的元信息（优先写入数据库）"""
     try:
-        stat = os.stat(abs_src_path)
+        stat = _safe_stat(abs_src_path)
+        if stat is None:
+            return  # 无法获取 stat 信息，跳过元信息写入
         if file_hash is None:
             file_hash = _compute_file_hash(abs_src_path) or "unknown"
 
@@ -178,15 +222,36 @@ def backup_file(abs_src_path: str, config: Config, logger) -> str:
     if _should_exclude(relative, config):
         return "skipped"
 
+    # per-file 锁：防止同一文件被并发备份
+    flock = _get_file_lock(abs_src_path)
+    if not flock.acquire(timeout=0.1):
+        return "skipped"  # 另一个线程正在备份此文件
+
+    # 注册为活跃备份（供 watcher 等待）
+    norm_path = os.path.normcase(os.path.abspath(abs_src_path))
+    with _active_backups_cond:
+        _active_backups.add(norm_path)
+
+    try:
+        return _backup_file_inner(abs_src_path, watch_root, relative, config, logger)
+    finally:
+        flock.release()
+        with _active_backups_cond:
+            _active_backups.discard(norm_path)
+            _active_backups_cond.notify_all()
+
+
+def _backup_file_inner(abs_src_path: str, watch_root: str,
+                       relative: str, config: Config, logger) -> str:
+    """备份核心逻辑（已在 per-file 锁内）"""
     backup_path = os.path.join(config.backup_dir, relative)
 
     # 快速路径：如果文件大小和修改时间都没变，跳过备份
-    try:
-        src_stat = os.stat(abs_src_path)
-        src_size = src_stat.st_size
-        src_mtime = src_stat.st_mtime
-    except OSError:
-        return "skipped"
+    src_stat = _safe_stat(abs_src_path)
+    if src_stat is None:
+        return "skipped"  # 无法获取文件元数据（如 SMB WinError 50）
+    src_size = src_stat.st_size
+    src_mtime = src_stat.st_mtime
 
     if os.path.exists(backup_path):
         meta = _read_meta(backup_path, watch_root, relative)
@@ -198,76 +263,73 @@ def backup_file(abs_src_path: str, config: Config, logger) -> str:
         except (ValueError, TypeError):
             pass
 
-    # 在锁外计算源文件哈希，避免大文件哈希计算长时间持有全局锁
+    # 在锁外计算源文件哈希，避免大文件哈希计算长时间持有锁
     src_hash = _compute_file_hash(abs_src_path)
     if src_hash is None:
         return "failed"
 
-    with _backup_lock:
-        try:
-            # 如果备份已存在，比较哈希
-            if os.path.exists(backup_path):
-                backup_hash = _compute_hash_for_backup(backup_path, watch_root, relative)
-                if backup_hash and backup_hash == src_hash:
-                    return "skipped"
+    # per-file 锁已保证同一文件不会并发备份，不同文件可并行复制
+    try:
+        # 如果备份已存在，比较哈希
+        if os.path.exists(backup_path):
+            backup_hash = _compute_hash_for_backup(backup_path, watch_root, relative)
+            if backup_hash and backup_hash == src_hash:
+                return "skipped"
 
-                # 内容变了，删除旧备份及其元信息
-                _delete_file_safe(backup_path)
-                _delete_file_safe(backup_path + ".meta")
+            # 内容变了，删除旧备份及其元信息
+            _delete_file_safe(backup_path)
+            _delete_file_safe(backup_path + ".meta")
 
-            # 复制到备份目录
-            backup_dir = os.path.dirname(backup_path)
+        # 复制到备份目录（目录创建用独立锁保护）
+        backup_dir = os.path.dirname(backup_path)
+        with _makedirs_lock:
             os.makedirs(backup_dir, exist_ok=True)
 
-            shutil.copy2(abs_src_path, backup_path)
-            _write_meta(backup_path, abs_src_path, src_hash, watch_root, relative)
+        shutil.copy2(abs_src_path, backup_path)
+        _write_meta(backup_path, abs_src_path, src_hash, watch_root, relative)
 
-            # ── 竞态校验：备份后重新 stat 源文件 ──────────────
-            # 检测备份期间是否有并发写入或删除
+        # ── 竞态校验：备份后重新 stat 源文件 ──────────────
+        post_stat = _safe_stat(abs_src_path)
+        if post_stat is None:
+            # 源文件在备份期间被删除或不可访问
             try:
-                post_stat = os.stat(abs_src_path)
-                post_size = post_stat.st_size
-                post_mtime = post_stat.st_mtime
-            except OSError:
-                # 源文件在备份期间被删除 → 将备份移入回收站
-                try:
-                    from .recycler import move_to_recycle
-                    rp = move_to_recycle(
-                        abs_src_path, False, config, logger
-                    )
-                    if rp:
-                        logger.info(
-                            f"备份后源文件已删除，已移入回收站: {relative}"
-                        )
-                    else:
-                        logger.warning(
-                            f"备份后源文件已删除，移入回收站失败: {relative}"
-                        )
-                except Exception as exc:
-                    logger.error(f"移入回收站失败 {relative}: {exc}")
-                return "source_gone"
-
-            if (post_size != src_size or
-                    abs(post_mtime - src_mtime) > 0.001):
-                # 文件在备份期间被并发修改，备份内容可能不一致
-                # 返回 dirty，让调用方不更新缓存，下轮重新备份
-                logger.debug(
-                    f"备份期间文件被并发修改: {relative}，将在下轮重新备份"
+                from .recycler import move_to_recycle
+                rp = move_to_recycle(
+                    abs_src_path, False, config, logger
                 )
-                return "dirty"
+                if rp:
+                    logger.info(
+                        f"备份后源文件已删除，已移入回收站: {relative}"
+                    )
+                else:
+                    logger.warning(
+                        f"备份后源文件已删除，移入回收站失败: {relative}"
+                    )
+            except Exception as exc:
+                logger.error(f"移入回收站失败 {relative}: {exc}")
+            return "source_gone"
 
-            logger.debug(f"备份: {relative}")
-            return "backed_up"
+        post_size = post_stat.st_size
+        post_mtime = post_stat.st_mtime
 
-        except Exception as e:
-            logger.error(f"备份失败 {relative}: {e}")
-            return "failed"
+        if (post_size != src_size or
+                abs(post_mtime - src_mtime) > 0.001):
+            logger.debug(
+                f"备份期间文件被并发修改: {relative}，将在下轮重新备份"
+            )
+            return "dirty"
+
+        logger.debug(f"备份: {relative}")
+        return "backed_up"
+
+    except Exception as e:
+        logger.error(f"备份失败 {relative}: {e}")
+        return "failed"
 
 
 def remove_backup(abs_src_path: str, config: Config, logger) -> bool:
     """
     从备份镜像中移除对应文件（当源文件被正常删除时调用）。
-    注意：deleted 逻辑会将文件移动到回收站，这里是从备份目录清理残留。
     """
     watch_root = config.find_watch_root(abs_src_path)
     if watch_root is None:
@@ -280,14 +342,13 @@ def remove_backup(abs_src_path: str, config: Config, logger) -> bool:
 
     backup_path = os.path.join(config.backup_dir, relative)
 
-    with _backup_lock:
-        try:
-            if os.path.exists(backup_path):
-                return _delete_file_safe(backup_path)
-            return True
-        except Exception as e:
-            logger.error(f"移除备份失败 {relative}: {e}")
-            return False
+    try:
+        if os.path.exists(backup_path):
+            return _delete_file_safe(backup_path)
+        return True
+    except Exception as e:
+        logger.error(f"移除备份失败 {relative}: {e}")
+        return False
 
 
 def get_backup_path(abs_src_path: str, config: Config) -> Optional[str]:
@@ -302,28 +363,102 @@ def get_backup_path(abs_src_path: str, config: Config) -> Optional[str]:
     return None
 
 
-def backup_full_tree(config: Config, logger) -> int:
+def backup_full_tree(config: Config, logger, max_workers: int = 8) -> int:
     """
     递归备份整个监控目录树（初始化时调用）。
+
+    流式处理（亿级优化）：
+    - 边遍历边备份，每攒够一批（2000 个）就提交线程池
+    - 不会将所有文件路径一次性加载到内存
+    - 8 线程并行复制（移除全局锁后真正并行）
+
     返回备份的文件数量。
     """
     count = 0
+    failed = 0
+    total_found = 0
+    _BATCH_SIZE = 2000
+
     for watch_path in config.watch_paths:
         if not os.path.exists(watch_path):
             logger.warning(f"监控路径不存在: {watch_path}")
             continue
 
-        for root, dirs, files in os.walk(watch_path):
-            # 过滤排除的目录
-            dirs[:] = [
-                d for d in dirs
-                if d not in config.exclude_dirs
-            ]
+        logger.info(f"初始备份: 开始流式遍历 {watch_path} (workers={max_workers})")
 
-            for file_name in files:
-                full_path = os.path.join(root, file_name)
-                if backup_file(full_path, config, logger) == "backed_up":
-                    count += 1
+        # 流式遍历：攒够一批就提交，不一次性加载所有路径
+        batch = []
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            pending_futures = []
 
-    logger.info(f"初始备份完成，共备份 {count} 个文件")
+            for root, dirs, files in os.walk(watch_path):
+                dirs[:] = [
+                    d for d in dirs
+                    if d not in config.exclude_dirs
+                ]
+                for file_name in files:
+                    full_path = os.path.join(root, file_name)
+                    rel = os.path.relpath(full_path, watch_path)
+                    if not _should_exclude(rel, config):
+                        batch.append(full_path)
+
+                    # 攒够一批，提交线程池
+                    if len(batch) >= _BATCH_SIZE:
+                        futures = [
+                            pool.submit(backup_file, fp, config, logger)
+                            for fp in batch
+                        ]
+                        pending_futures.extend(futures)
+                        total_found += len(batch)
+                        batch.clear()
+
+                        # 收割已完成的 future，避免内存积压
+                        done_futures = [f for f in pending_futures if f.done()]
+                        for f in done_futures:
+                            try:
+                                result = f.result()
+                                if result == "backed_up":
+                                    count += 1
+                                elif result == "failed":
+                                    failed += 1
+                            except Exception as e:
+                                failed += 1
+                                logger.error(f"初始备份异常: {e}")
+                        pending_futures = [
+                            f for f in pending_futures if not f.done()
+                        ]
+
+                        done_total = count + failed
+                        if done_total % 5000 < _BATCH_SIZE:
+                            logger.info(
+                                f"初始备份进度: 已发现 {total_found} 个文件, "
+                                f"已备份 {count}, 失败 {failed}"
+                            )
+
+            # 处理最后一批
+            if batch:
+                futures = [
+                    pool.submit(backup_file, fp, config, logger)
+                    for fp in batch
+                ]
+                pending_futures.extend(futures)
+                total_found += len(batch)
+                batch.clear()
+
+            # 收割所有剩余 future
+            for future in as_completed(pending_futures):
+                try:
+                    result = future.result()
+                    if result == "backed_up":
+                        count += 1
+                    elif result == "failed":
+                        failed += 1
+                except Exception as e:
+                    failed += 1
+                    logger.error(f"初始备份异常: {e}")
+
+    logger.info(
+        f"初始备份完成: 发现 {total_found} 个文件, "
+        f"共备份 {count} 个, 失败 {failed} 个"
+    )
     return count

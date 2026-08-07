@@ -1,18 +1,26 @@
 """
 Web 管理界面 - FastAPI 应用
 提供浏览、搜索、恢复已删除文件的功能
+
+性能优化（亿级场景）：
+- 文件列表使用后端分页查询，不再全量加载
+- 统计接口使用数据库聚合（COUNT/SUM），不再 os.walk 遍历
+- 统计结果缓存 60 秒，避免频繁查询
 """
 
 import os
 import time
 import datetime
+import threading
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 from core.config import Config
+from core.database import get_db
 from core.recycler import (
-    list_recycled_files, restore_from_recycle, empty_recycle
+    list_recycled_files, list_recycled_files_paged,
+    restore_from_recycle, empty_recycle
 )
 
 
@@ -23,6 +31,11 @@ def create_app(config: Config, logger) -> FastAPI:
     templates = Jinja2Templates(
         directory=os.path.join(os.path.dirname(__file__), "templates")
     )
+
+    # ── 统计缓存 ────────────────────────────────────────────
+    _stats_cache = {"value": None, "timestamp": 0}
+    _stats_lock = threading.Lock()
+    _STATS_CACHE_TTL = 60  # 缓存 60 秒
 
     # ── 认证中间件 ──────────────────────────────────────────
 
@@ -80,6 +93,11 @@ def create_app(config: Config, logger) -> FastAPI:
         else:
             return f"{int(diff / 86400)} 天前"
 
+    def _invalidate_stats_cache():
+        """使统计缓存失效"""
+        with _stats_lock:
+            _stats_cache["timestamp"] = 0
+
     # ── 页面路由 ────────────────────────────────────────────
 
     @app.get("/")
@@ -93,27 +111,18 @@ def create_app(config: Config, logger) -> FastAPI:
 
     @app.get("/api/files")
     async def api_files(search: str = "", page: int = 1, page_size: int = 20):
-        """获取回收站文件列表（JSON API，支持分页）"""
-        search_lower = search.lower()
-        all_files = list_recycled_files(config)
+        """获取回收站文件列表（JSON API，后端分页）"""
+        # 使用后端分页查询，不再全量加载
+        page_files, total = list_recycled_files_paged(
+            config, page=page, page_size=page_size, search=search
+        )
 
-        if search_lower:
-            all_files = [
-                f for f in all_files
-                if search_lower in f.get("relative_path", "").lower()
-                or search_lower in f.get("original_path", "").lower()
-            ]
-
-        total = len(all_files)
         total_pages = max(1, (total + page_size - 1) // page_size)
-        page = max(1, min(page, total_pages))
-        start = (page - 1) * page_size
-        end = start + page_size
-        page_files = all_files[start:end]
+        actual_page = max(1, min(page, total_pages))
 
         return {
             "total": total,
-            "page": page,
+            "page": actual_page,
             "page_size": page_size,
             "total_pages": total_pages,
             "files": [
@@ -181,6 +190,7 @@ def create_app(config: Config, logger) -> FastAPI:
         result = restore_from_recycle(rel_path, config, logger)
 
         if result:
+            _invalidate_stats_cache()
             return {"success": True, "restored_to": result}
         else:
             return JSONResponse(
@@ -192,11 +202,54 @@ def create_app(config: Config, logger) -> FastAPI:
     async def api_empty():
         """清空回收站"""
         count = empty_recycle(config, logger)
+        _invalidate_stats_cache()
         return {"success": True, "cleaned": count}
 
     @app.get("/api/stats")
     async def api_stats():
-        """获取统计信息"""
+        """
+        获取统计信息。
+        优化：使用数据库聚合替代 os.walk，结果缓存 60 秒。
+        """
+        now = time.time()
+
+        # 检查缓存
+        with _stats_lock:
+            if (_stats_cache["value"] is not None
+                    and now - _stats_cache["timestamp"] < _STATS_CACHE_TTL):
+                return _stats_cache["value"]
+
+        # 从数据库获取统计（毫秒级），不再 os.walk
+        db = get_db()
+        if db is not None:
+            try:
+                recycled_count = db.count_recycle_meta()
+                recycled_total_size = db.sum_recycle_size()
+                backup_size = db.sum_backup_size()
+
+                # 回收站目录实际大小仍需遍历（但频率低，可接受）
+                # 优先使用数据库记录的 file_size 总和
+                recycle_size = recycled_total_size
+
+                result = {
+                    "recycled_count": recycled_count,
+                    "recycled_total_size": recycled_total_size,
+                    "recycled_formatted": _format_size(recycled_total_size),
+                    "backup_size": backup_size,
+                    "backup_formatted": _format_size(backup_size),
+                    "recycle_dir_size": recycle_size,
+                    "recycle_formatted": _format_size(recycle_size),
+                }
+
+                with _stats_lock:
+                    _stats_cache["value"] = result
+                    _stats_cache["timestamp"] = now
+
+                return result
+            except Exception:
+                pass  # 回退到文件遍历方式
+
+        # 回退：文件遍历方式（无数据库时）
         files = list_recycled_files(config)
         total_size = sum(f.get("file_size", 0) for f in files)
         backup_size = 0
@@ -218,7 +271,7 @@ def create_app(config: Config, logger) -> FastAPI:
                     except OSError:
                         pass
 
-        return {
+        result = {
             "recycled_count": len(files),
             "recycled_total_size": total_size,
             "recycled_formatted": _format_size(total_size),
@@ -227,6 +280,12 @@ def create_app(config: Config, logger) -> FastAPI:
             "recycle_dir_size": recycle_size,
             "recycle_formatted": _format_size(recycle_size),
         }
+
+        with _stats_lock:
+            _stats_cache["value"] = result
+            _stats_cache["timestamp"] = now
+
+        return result
 
     return app
 

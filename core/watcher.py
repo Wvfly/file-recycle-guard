@@ -34,9 +34,12 @@ class RecycleGuardHandler(FileSystemEventHandler):
         self.config = config
         self.logger = logger
         # 去重队列：避免短时间内重复事件（Windows 上 modify 可能触发多次）
-        self._recent_events: deque = deque(maxlen=500)
+        # 扩容到 5000，应对大批量删除场景
+        self._recent_events: deque = deque(maxlen=5000)
         # 待确认的删除事件：(路径, 是否目录, 事件时间)
         self._pending_deletes: deque = deque()
+        # 用 set 加速路径查找（O(1) 替代 O(n) 线性搜索）
+        self._pending_paths: set = set()
         self._pending_lock = threading.Lock()
         # 单一工作线程处理延迟删除，避免每个删除事件新建线程
         self._delete_worker = threading.Thread(
@@ -61,9 +64,9 @@ class RecycleGuardHandler(FileSystemEventHandler):
         return False
 
     def _is_pending_delete(self, src_path: str) -> bool:
-        """检查该路径是否已在待删除队列中（避免重复加入）"""
+        """检查该路径是否已在待删除队列中（O(1) set 查找）"""
         with self._pending_lock:
-            return any(p == src_path for p, _, _ in self._pending_deletes)
+            return src_path in self._pending_paths
 
     def _is_under(self, path: str, base: str) -> bool:
         """判断 path 是否位于 base 目录内（归一化比较，避免前缀误匹配）"""
@@ -131,12 +134,12 @@ class RecycleGuardHandler(FileSystemEventHandler):
         # 延迟处理：因为有些程序（如 Office）会先删除再创建临时文件
         # 加入待确认队列，由工作线程在延迟后确认文件未被重建再回收
         with self._pending_lock:
-            # 检查是否已在队列中，避免重复
-            already_pending = any(p == event.src_path for p, _, _ in self._pending_deletes)
-            if not already_pending:
+            # O(1) set 检查替代 O(n) 线性搜索
+            if event.src_path not in self._pending_paths:
                 self._pending_deletes.append(
                     (event.src_path, event.is_directory, time.time())
                 )
+                self._pending_paths.add(event.src_path)
 
     def _delete_worker_loop(self):
         """后台工作线程：处理到期的待确认删除事件"""
@@ -147,6 +150,7 @@ class RecycleGuardHandler(FileSystemEventHandler):
                     src_path, is_directory, ts = self._pending_deletes[0]
                     if time.time() - ts >= _DELETE_CONFIRM_DELAY:
                         item = self._pending_deletes.popleft()
+                        self._pending_paths.discard(src_path)
             if item is None:
                 time.sleep(0.1)
                 continue
@@ -179,13 +183,16 @@ class RecycleGuardHandler(FileSystemEventHandler):
                 move_to_recycle(src_path, is_directory, self.config, self.logger)
 
     def _wait_for_backup(self, src_path: str):
-        """等待正在进行的备份操作完成"""
-        from .backup import _backup_lock
-        if _backup_lock.locked():
-            self.logger.debug(f"等待备份操作完成: {src_path}")
-            acquired = _backup_lock.acquire(timeout=_BACKUP_WAIT_TIMEOUT)
-            if acquired:
-                _backup_lock.release()
+        """等待指定文件的备份操作完成"""
+        from .backup import _active_backups, _active_backups_cond
+        norm = os.path.normcase(os.path.abspath(src_path))
+        with _active_backups_cond:
+            if norm in _active_backups:
+                self.logger.debug(f"等待备份操作完成: {src_path}")
+                _active_backups_cond.wait_for(
+                    lambda: norm not in _active_backups,
+                    timeout=_BACKUP_WAIT_TIMEOUT
+                )
                 # 额外等待让文件系统操作完成
                 time.sleep(0.5)
 
@@ -209,11 +216,11 @@ class RecycleGuardHandler(FileSystemEventHandler):
             return
         self.logger.info(f"文件被移出监控目录（视为删除）: {event.src_path}")
         with self._pending_lock:
-            already_pending = any(p == event.src_path for p, _, _ in self._pending_deletes)
-            if not already_pending:
+            if event.src_path not in self._pending_paths:
                 self._pending_deletes.append(
                     (event.src_path, event.is_directory, time.time())
                 )
+                self._pending_paths.add(event.src_path)
 
 
 def start_watcher(config: Config, logger):
