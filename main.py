@@ -16,6 +16,7 @@ import signal
 import time
 import argparse
 import threading
+import ctypes
 
 from core.config import load_config, Config, get_exe_dir
 from core.logger import setup_logger
@@ -146,6 +147,16 @@ class RecycleGuard:
             self.stop()
 
 
+def _process_exists(pid: int) -> bool:
+    """检查进程是否存在（Windows 兼容）"""
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if handle:
+        kernel32.CloseHandle(handle)
+        return True
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="文件回收站守护程序 - 保护共享文件不被远程删除"
@@ -185,13 +196,17 @@ def main():
         if os.path.exists(pid_file):
             with open(pid_file, "r") as f:
                 pid = int(f.read().strip())
-            try:
-                os.kill(pid, signal.SIGTERM)
+            if _process_exists(pid):
+                # Windows 下使用 TerminateProcess 替代 os.kill(SIGTERM)
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.OpenProcess(1, False, pid)  # PROCESS_TERMINATE
+                if handle:
+                    kernel32.TerminateProcess(handle, 0)
+                    kernel32.CloseHandle(handle)
                 print(f"已发送停止信号到进程 {pid}")
-                os.remove(pid_file)
-            except OSError:
+            else:
                 print(f"进程 {pid} 已不存在")
-                os.remove(pid_file)
+            os.remove(pid_file)
         else:
             print("未找到运行中的守护程序（PID 文件不存在）")
 
@@ -199,10 +214,9 @@ def main():
         if os.path.exists(pid_file):
             with open(pid_file, "r") as f:
                 pid = int(f.read().strip())
-            try:
-                os.kill(pid, 0)
+            if _process_exists(pid):
                 print(f"守护程序运行中 (PID: {pid})")
-            except OSError:
+            else:
                 print("守护程序未运行（PID 文件残留）")
         else:
             print("守护程序未运行")

@@ -1,4 +1,5 @@
 @echo off
+python _fix_crlf.py "%~f0" 2>nul
 chcp 65001 >nul
 title 文件回收站守护程序
 

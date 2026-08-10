@@ -1,4 +1,5 @@
 @echo off
+python _fix_crlf.py "%~f0" 2>nul
 chcp 65001 >nul
 REM ============================================================
 REM  Nuitka Onefile 打包脚本 - 文件回收站守护程序
