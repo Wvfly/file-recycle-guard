@@ -1,0 +1,2 @@
+# Windows 批处理文件必须使用 CRLF 换行符
+*.bat text eol=crlf
