@@ -12,6 +12,8 @@ import os
 import time
 import datetime
 import threading
+import logging
+from logging.handlers import TimedRotatingFileHandler
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -24,8 +26,43 @@ from core.recycler import (
 )
 
 
+def _setup_access_logger(config: Config) -> logging.Logger:
+    """创建独立的 Web 访问日志器，输出到 logs/access.log 并按天轮转"""
+    access_logger = logging.getLogger("FileRecycleGuard.access")
+    access_logger.setLevel(logging.INFO)
+    access_logger.propagate = False  # 不向父 logger 传播，避免重复输出
+
+    if getattr(access_logger, "_access_initialized", False):
+        return access_logger
+
+    # 从主日志路径推导 access.log 位置（同目录）
+    log_base = os.path.dirname(config.log.file)
+    if not log_base:
+        log_base = "logs"
+    access_log_path = os.path.join(log_base, "access.log")
+
+    os.makedirs(os.path.dirname(access_log_path), exist_ok=True)
+
+    handler = TimedRotatingFileHandler(
+        access_log_path,
+        when="midnight",
+        backupCount=max(1, config.log.max_days),
+        encoding="utf-8"
+    )
+    handler.setFormatter(logging.Formatter(
+        "[%(asctime)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    access_logger.addHandler(handler)
+    access_logger._access_initialized = True
+    return access_logger
+
+
 def create_app(config: Config, logger) -> FastAPI:
     app = FastAPI(title="文件回收站管理")
+
+    # ── 访问日志 ────────────────────────────────────────────
+    access_logger = _setup_access_logger(config)
 
     # 模板目录
     templates = Jinja2Templates(
@@ -65,6 +102,20 @@ def create_app(config: Config, logger) -> FastAPI:
                 headers={"WWW-Authenticate": 'Basic realm="FileRecycleGuard"'},
             )
         return await call_next(request)
+
+    @app.middleware("http")
+    async def access_log_middleware(request: Request, call_next):
+        """记录每个 HTTP 请求到 access.log"""
+        start = time.time()
+        response = await call_next(request)
+        duration_ms = (time.time() - start) * 1000
+        client = request.client.host if request.client else "-"
+        access_logger.info(
+            f'{client} - {request.method} {request.url.path}'
+            f'{"?" + request.url.query if request.url.query else ""}'
+            f' {response.status_code} {duration_ms:.1f}ms'
+        )
+        return response
 
     # ── 工具函数 ────────────────────────────────────────────
 
@@ -307,7 +358,7 @@ def start_web(config: Config, logger):
             app,
             host=config.web.host,
             port=config.web.port,
-            log_level="warning",
+            log_level="warning",  # 抑制 uvicorn 默认访问日志，由 access_log_middleware 处理
         ),
         daemon=True,
         name="WebUI",

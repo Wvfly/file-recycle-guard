@@ -12,6 +12,7 @@
 - os.scandir() 替代 os.listdir()：一次系统调用获取文件名+stat
 - 批量 SQLite 查询：IN 子句替代逐个 SELECT
 - 内存 LRU 热缓存：最近访问的文件 mtime/size 放内存，加速高频访问
+- 单 writer thread 消费写入队列，避免多线程 SQLite 写锁竞争（P1-8）
 """
 
 import os
@@ -20,6 +21,7 @@ import sqlite3
 import threading
 import fnmatch
 import hashlib
+import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Tuple, Optional, List, Set, Any
 from collections import OrderedDict
@@ -478,16 +480,21 @@ _PCACHE_BUFFER_THRESHOLD = 100
 
 
 def _flush_pcache_buffer(pcache: 'PersistentFileCache'):
-    """刷新 SQLite 持久化缓存写入缓冲区（批量 set_batch）"""
+    """刷新 SQLite 持久化缓存写入缓冲区（通过 writer 队列异步写入，P1-8）"""
     with _pcache_buffer_lock:
         if not _pcache_buffer:
             return
         items = _pcache_buffer[:]
         _pcache_buffer.clear()
-    try:
-        pcache.set_batch(items)
-    except Exception:
-        pass
+    # 通过 writer 队列提交，避免多线程直接写 SQLite
+    if _sqlite_writer_queue is not None:
+        _sqlite_writer_queue.put(("set_batch", pcache, items))
+    else:
+        # writer 未启动，回退到直接写入
+        try:
+            pcache.set_batch(items)
+        except Exception:
+            pass
 
 
 def _get_caches(cache_dir: str) -> Tuple[PersistentFileCache,
@@ -582,6 +589,48 @@ class IncrementalScanner:
                 self._total_dirs = dir_cache.count()
             self._dirs_built = True
 
+    def _discover_new_directories(self, config: Config,
+                                   dir_cache: DirectoryTreeCache, logger):
+        """
+        发现磁盘上存在但不在目录树缓存中的新目录。
+        解决 watchdog 缓冲区溢出导致新目录创建事件丢失的问题。
+        """
+        new_dirs = []  # [(dir_path, watch_path), ...]
+        for watch_path in config.watch_paths:
+            if not os.path.exists(watch_path):
+                continue
+            norm_watch = os.path.normcase(os.path.abspath(watch_path))
+            base_depth = norm_watch.count(os.sep)
+            for root, dirs, files in os.walk(watch_path):
+                dirs[:] = [d for d in dirs if d not in config.exclude_dirs]
+                for d in dirs:
+                    dir_path = os.path.normcase(
+                        os.path.abspath(os.path.join(root, d))
+                    )
+                    # 检查是否已在缓存中（快速查询）
+                    if dir_cache.get_dir_mtime(dir_path) == 0.0:
+                        new_dirs.append((dir_path, norm_watch))
+
+        if new_dirs:
+            logger.info(f"发现 {len(new_dirs)} 个新目录，更新目录树缓存...")
+            conn = dir_cache._get_conn()
+            for dir_path, norm_watch in new_dirs:
+                parent = os.path.dirname(dir_path)
+                depth = dir_path.count(os.sep) - norm_watch.count(os.sep)
+                dir_st = _safe_stat(dir_path)
+                mtime = dir_st.st_mtime if dir_st else 0.0
+                try:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO dir_tree "
+                        "(path, mtime, parent, depth) VALUES (?, ?, ?, ?)",
+                        (dir_path, mtime, parent, depth)
+                    )
+                except Exception:
+                    pass
+            conn.commit()
+            self._total_dirs = dir_cache.count()
+            logger.info(f"目录树已更新: {self._total_dirs} 个目录")
+
     def scan_batch(self, config: Config, logger,
                    pcache: PersistentFileCache,
                    mcache: MemoryLRUCache,
@@ -601,6 +650,13 @@ class IncrementalScanner:
         返回 (backed_up, skipped, scanned) 三元组。
         """
         self._ensure_dir_tree(config, dir_cache, logger)
+
+        # 每 10 轮检查一次是否有新目录（watchdog 事件丢失时的补偿）
+        if self._round % 10 == 0 and self._cursor == 0:
+            try:
+                self._discover_new_directories(config, dir_cache, logger)
+            except Exception as e:
+                logger.error(f"新目录发现失败: {e}")
 
         # 检查是否需要重置游标（上一轮扫完）
         if self._cursor >= self._total_dirs and self._total_dirs > 0:
@@ -759,13 +815,25 @@ class IncrementalScanner:
                                         items = _pcache_buffer[:]
                                         _pcache_buffer.clear()
                                 if items is not None:
-                                    try:
-                                        _pc.set_batch(items)
-                                    except Exception:
-                                        pass
+                                    # P1-8: 通过 writer 队列写入
+                                    if _sqlite_writer_queue is not None:
+                                        _sqlite_writer_queue.put(
+                                            ("set_batch", _pc, items)
+                                        )
+                                    else:
+                                        try:
+                                            _pc.set_batch(items)
+                                        except Exception:
+                                            pass
                             elif result in ("dirty", "source_gone"):
                                 mcache.delete(_ck)
-                                pcache.delete(_ck)
+                                # P1-8: 通过 writer 队列删除，避免多线程写 SQLite
+                                if _sqlite_writer_queue is not None:
+                                    _sqlite_writer_queue.put(
+                                        ("delete", _pc, _ck)
+                                    )
+                                else:
+                                    _pc.delete(_ck)
                         except Exception as e:
                             logger.error(
                                 f"异步备份失败 {_fp}: {e}"
@@ -816,8 +884,10 @@ class IncrementalScanner:
         return self._cursor, self._total_dirs
 
     def shutdown(self):
-        """关闭备份线程池"""
+        """关闭备份线程池 + 刷新 SQLite writer"""
         self._backup_pool.shutdown(wait=False)
+        # P1-8: 等待 writer 线程处理完残余写入
+        _flush_sqlite_writer()
 
 
 def _dir_has_changes(dir_path: str, cached_mtime: float) -> bool:
@@ -830,6 +900,78 @@ def _dir_has_changes(dir_path: str, cached_mtime: float) -> bool:
     if st is None:
         return True  # stat 失败，保守地认为有变化
     return st.st_mtime > cached_mtime
+
+
+# ── SQLite 单 writer 线程（P1-8） ────────────────────────────
+
+_sqlite_writer_queue: Optional['queue.Queue'] = None
+_sqlite_writer_thread: Optional[threading.Thread] = None
+_writer_lock = threading.Lock()
+
+
+def _start_sqlite_writer():
+    """启动 SQLite 单 writer 线程（P1-8）"""
+    global _sqlite_writer_queue, _sqlite_writer_thread
+    with _writer_lock:
+        if _sqlite_writer_thread is not None:
+            return
+        _sqlite_writer_queue = queue.Queue()
+
+        def _writer_loop():
+            q = _sqlite_writer_queue
+            while True:
+                try:
+                    item = q.get()
+                    if item is None:  # 关闭信号
+                        break
+                    op = item[0]
+                    try:
+                        if op == "set_batch":
+                            # item = (op, pcache, items_list)
+                            item[1].set_batch(item[2])
+                        elif op == "delete":
+                            # item = (op, pcache, path_hash)
+                            item[1].delete(item[2])
+                        elif op == "delete_batch":
+                            # item = (op, pcache, path_hashes_list)
+                            item[1].delete_batch(item[2])
+                        elif op == "flush":
+                            # 强制 commit（writer 的 set_batch 已自带 commit）
+                            pass
+                        elif op == "done":
+                            # 通知调用方刷新完成
+                            item[1].set()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+        _sqlite_writer_thread = threading.Thread(
+            target=_writer_loop,
+            daemon=True,
+            name="SQLiteWriter"
+        )
+        _sqlite_writer_thread.start()
+
+
+def _flush_sqlite_writer():
+    """等待 writer 线程处理完所有待处理的写入"""
+    if _sqlite_writer_queue is None or _sqlite_writer_thread is None:
+        return
+    done_event = threading.Event()
+    _sqlite_writer_queue.put(("done", done_event))
+    done_event.wait(timeout=30)
+
+
+def _stop_sqlite_writer():
+    """停止 writer 线程"""
+    global _sqlite_writer_queue, _sqlite_writer_thread
+    if _sqlite_writer_queue is not None:
+        _sqlite_writer_queue.put(None)
+    if _sqlite_writer_thread is not None:
+        _sqlite_writer_thread.join(timeout=10)
+        _sqlite_writer_thread = None
+        _sqlite_writer_queue = None
 
 
 # ── 同步线程 ───────────────────────────────────────────────────
@@ -895,6 +1037,8 @@ def _sync_thread(config: Config, logger, stop_event: threading.Event):
                 stop_event.wait(remaining)
     finally:
         scanner.shutdown()
+        # P1-8: 停止 SQLite writer 线程
+        _stop_sqlite_writer()
 
 
 def start_sync(config: Config, logger) -> tuple:
@@ -906,6 +1050,10 @@ def start_sync(config: Config, logger) -> tuple:
     if not config.sync.enabled:
         logger.info("定期同步已禁用")
         return None, None
+
+    # P1-8: 启动 SQLite 单 writer 线程
+    _start_sqlite_writer()
+    logger.info("SQLite 单 writer 线程已启动")
 
     stop_event = threading.Event()
     thread = threading.Thread(

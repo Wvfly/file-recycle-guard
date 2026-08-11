@@ -10,6 +10,8 @@ MySQL 元数据存储模块
 - 批量 upsert 减少数据库交互次数
 - 路径哈希索引提升区分度
 - 连接断线自动重连
+- 连接池复用 MySQL 连接（P1-7）
+- 增量统计计数器：stats 表 + 内存缓存，O(1) 查询（P1-6）
 """
 
 import time
@@ -18,6 +20,61 @@ import threading
 import pymysql
 from typing import Optional, Dict, List, Tuple
 from pymysql.cursors import DictCursor
+
+
+# ── MySQL 连接池（P1-7） ─────────────────────────────────────
+
+class ConnectionPool:
+    """
+    简单的 MySQL 连接池。
+    线程安全，支持连接健康检查和最大空闲连接数限制。
+    """
+
+    def __init__(self, max_size: int = 16, config: dict = None):
+        self._pool: list = []
+        self._max_size = max_size
+        self._config = config or {}
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        """从池中获取连接，池空时创建新连接"""
+        with self._lock:
+            while self._pool:
+                conn = self._pool.pop()
+                try:
+                    if conn.open:
+                        conn.ping()
+                        return conn
+                except Exception:
+                    pass
+                self._safe_close(conn)
+        return pymysql.connect(**self._config)
+
+    def release(self, conn):
+        """归还连接到池"""
+        try:
+            if conn and conn.open:
+                with self._lock:
+                    if len(self._pool) < self._max_size:
+                        self._pool.append(conn)
+                        return
+        except Exception:
+            pass
+        self._safe_close(conn)
+
+    def close_all(self):
+        """关闭池中所有连接"""
+        with self._lock:
+            for conn in self._pool:
+                self._safe_close(conn)
+            self._pool.clear()
+
+    @staticmethod
+    def _safe_close(conn):
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # 全局数据库实例
@@ -61,41 +118,34 @@ class Database:
         }
         self._local = threading.local()
         self._lock = threading.Lock()
+        # P1-7: 连接池
+        self._pool = ConnectionPool(max_size=16, config=self._config)
+        # P1-6: 增量统计内存缓存
+        self._stats_lock = threading.Lock()
+        self._stats_backup_count: Optional[int] = None
+        self._stats_backup_size: Optional[int] = None
+        self._stats_recycle_count: Optional[int] = None
+        self._stats_recycle_size: Optional[int] = None
 
     # ── 连接管理 ────────────────────────────────────────────
 
     def _get_conn(self):
-        """获取当前线程的数据库连接（惰性创建 + 健康检查 + 断线重连）"""
+        """获取当前线程的数据库连接（从连接池获取 + 健康检查）"""
         conn = getattr(self._local, "conn", None)
-        conn_time = getattr(self._local, "conn_time", 0)
-        # 连接健康检查：ping 检测 + 最大空闲时间回收
         if conn is not None:
-            if not conn.open:
-                conn = None
-            elif time.time() - conn_time > 3600:  # 1小时回收
+            try:
+                if conn.open:
+                    conn.ping()
+                    return conn
+            except Exception:
                 try:
                     conn.close()
                 except Exception:
                     pass
-                conn = None
-            else:
-                try:
-                    conn.ping()
-                except Exception:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    conn = None
-        if conn is None:
-            try:
-                conn = pymysql.connect(**self._config)
-            except pymysql.err.OperationalError:
-                # 短暂等待后重试一次
-                time.sleep(0.5)
-                conn = pymysql.connect(**self._config)
-            self._local.conn = conn
-            self._local.conn_time = time.time()
+            self._local.conn = None
+        # 从连接池获取
+        conn = self._pool.acquire()
+        self._local.conn = conn
         return conn
 
     def _retry_on_disconnect(self, func, *args, **kwargs):
@@ -107,11 +157,11 @@ class Database:
             return func(*args, **kwargs)
 
     def close(self):
-        """关闭当前线程的连接"""
+        """关闭当前线程的连接（归还到连接池）"""
         conn = getattr(self._local, "conn", None)
-        if conn and conn.open:
-            conn.close()
+        if conn is not None:
             self._local.conn = None
+            self._pool.release(conn)
 
     # ── 初始化 ──────────────────────────────────────────────
 
@@ -158,6 +208,14 @@ class Database:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                   COMMENT='回收站文件元信息'
             """)
+            # P1-6: 增量统计表
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS stats (
+                    name  VARCHAR(64) PRIMARY KEY,
+                    value BIGINT NOT NULL DEFAULT 0
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            conn.commit()
 
         # 自动迁移：为旧表添加 path_hash 列
         self._migrate_add_path_hash(conn)
@@ -267,9 +325,18 @@ class Database:
     def upsert_backup_meta(self, watch_root: str, rel_path: str,
                            file_hash: str, file_size: int, mtime: float,
                            source_path: str, backup_time: float):
-        """插入或更新备份元信息（使用路径哈希索引）"""
+        """插入或更新备份元信息（使用路径哈希索引 + 增量统计）"""
         ph = _path_hash(watch_root, rel_path)
         conn = self._get_conn()
+
+        # P1-6: 查询旧值以计算增量
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT file_size FROM backup_meta WHERE path_hash=%s",
+                (ph,)
+            )
+            old_row = cur.fetchone()
+
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO backup_meta
@@ -286,6 +353,13 @@ class Database:
                   source_path, backup_time, ph))
         conn.commit()
 
+        # P1-6: 增量更新统计
+        if old_row is None:
+            self._adjust_backup_stats(1, file_size)
+        else:
+            old_size = old_row[0] or 0
+            self._adjust_backup_stats(0, file_size - old_size)
+
     def batch_upsert_backup_meta(self, items: List[Dict]):
         """
         批量插入/更新备份元信息，减少数据库交互次数。
@@ -295,6 +369,25 @@ class Database:
         if not items:
             return
         conn = self._get_conn()
+
+        # P1-6: 查询已存在的 path_hash 及其 file_size（用于增量统计）
+        all_phs = [
+            _path_hash(it["watch_root"], it["rel_path"]) for it in items
+        ]
+        old_sizes: Dict[str, int] = {}
+        for i in range(0, len(all_phs), 500):
+            batch_phs = all_phs[i:i + 500]
+            placeholders = ",".join("%s" for _ in batch_phs)
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT path_hash, file_size FROM backup_meta "
+                    f"WHERE path_hash IN ({placeholders})",
+                    batch_phs
+                )
+                for row in cur.fetchall():
+                    old_sizes[row[0]] = row[1] or 0
+
+        # 执行批量 upsert
         batch_size = 100
         for i in range(0, len(items), batch_size):
             batch = items[i:i + batch_size]
@@ -325,16 +418,42 @@ class Database:
                 cur.execute(sql, values)
         conn.commit()
 
+        # P1-6: 增量更新统计
+        new_count = 0
+        size_delta = 0
+        for item in items:
+            ph = _path_hash(item["watch_root"], item["rel_path"])
+            new_size = item["file_size"]
+            if ph in old_sizes:
+                size_delta += new_size - old_sizes[ph]
+            else:
+                new_count += 1
+                size_delta += new_size
+        if new_count != 0 or size_delta != 0:
+            self._adjust_backup_stats(new_count, size_delta)
+
     def delete_backup_meta(self, watch_root: str, rel_path: str):
-        """删除备份元信息"""
+        """删除备份元信息（+ 增量统计）"""
         ph = _path_hash(watch_root, rel_path)
         conn = self._get_conn()
+
+        # 查询旧值以计算增量
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT file_size FROM backup_meta WHERE path_hash=%s",
+                (ph,)
+            )
+            old_row = cur.fetchone()
+
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM backup_meta WHERE path_hash=%s",
                 (ph,)
             )
         conn.commit()
+
+        if old_row is not None:
+            self._adjust_backup_stats(-1, -(old_row[0] or 0))
 
     def list_all_backup_meta(self) -> List[Dict]:
         """列出所有备份元信息（用于清理模块）
@@ -370,35 +489,130 @@ class Database:
                 last_id = row["id"]
             yield rows
 
-    # ── 统计聚合（数据库层完成，避免 Python 遍历） ────────────
+    # ── 统计聚合（P1-6: 增量计数器，O(1) 查询） ────────────
+
+    def _adjust_backup_stats(self, count_delta: int, size_delta: int):
+        """原子更新 MySQL stats 表 + 内存缓存（备份统计）"""
+        with self._stats_lock:
+            if self._stats_backup_count is not None:
+                self._stats_backup_count += count_delta
+                self._stats_backup_size += size_delta
+        try:
+            conn = self._get_conn()
+            with conn.cursor() as cur:
+                if count_delta != 0:
+                    cur.execute(
+                        "INSERT INTO stats (name, value) VALUES "
+                        "('backup_count', %s) "
+                        "ON DUPLICATE KEY UPDATE "
+                        "value = value + %s",
+                        (count_delta, count_delta)
+                    )
+                if size_delta != 0:
+                    cur.execute(
+                        "INSERT INTO stats (name, value) VALUES "
+                        "('backup_size', %s) "
+                        "ON DUPLICATE KEY UPDATE "
+                        "value = value + %s",
+                        (size_delta, size_delta)
+                    )
+            conn.commit()
+        except Exception:
+            # 统计更新失败不影响主流程，下次访问时会从 DB 重新加载
+            with self._stats_lock:
+                self._stats_backup_count = None
+
+    def _ensure_stats_loaded(self):
+        """确保内存统计缓存已加载（从 stats 表或回退到全表扫描）"""
+        with self._stats_lock:
+            if (self._stats_backup_count is not None
+                    and self._stats_recycle_count is not None):
+                return
+        try:
+            conn = self._get_conn()
+            stats_map = {}
+            with conn.cursor() as cur:
+                cur.execute("SELECT name, value FROM stats")
+                for row in cur.fetchall():
+                    stats_map[row[0]] = row[1]
+
+            with self._stats_lock:
+                if "backup_count" in stats_map:
+                    self._stats_backup_count = stats_map["backup_count"]
+                    self._stats_backup_size = stats_map.get("backup_size", 0)
+                else:
+                    # stats 表为空，从全表计算并写入
+                    self._recompute_stats_from_tables()
+
+                if self._stats_recycle_count is None:
+                    if "recycle_count" in stats_map:
+                        self._stats_recycle_count = stats_map["recycle_count"]
+                        self._stats_recycle_size = stats_map.get(
+                            "recycle_size", 0
+                        )
+                    else:
+                        self._recompute_stats_from_tables()
+        except Exception:
+            self._recompute_stats_from_tables()
+
+    def _recompute_stats_from_tables(self):
+        """从全表重新计算统计（仅在首次启动或 stats 表为空时调用）"""
+        try:
+            conn = self._get_conn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*), IFNULL(SUM(file_size),0) "
+                            "FROM backup_meta")
+                bc, bs = cur.fetchone()
+                cur.execute("SELECT COUNT(*), IFNULL(SUM(file_size),0) "
+                            "FROM recycle_meta")
+                rc, rs = cur.fetchone()
+
+            # 写入 stats 表
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO stats (name, value) VALUES "
+                    "('backup_count', %s), ('backup_size', %s), "
+                    "('recycle_count', %s), ('recycle_size', %s) "
+                    "ON DUPLICATE KEY UPDATE value = VALUES(value)",
+                    (bc, bs, rc, rs)
+                )
+            conn.commit()
+
+            with self._stats_lock:
+                self._stats_backup_count = bc
+                self._stats_backup_size = bs
+                self._stats_recycle_count = rc
+                self._stats_recycle_size = rs
+        except Exception:
+            with self._stats_lock:
+                self._stats_backup_count = 0
+                self._stats_backup_size = 0
+                self._stats_recycle_count = 0
+                self._stats_recycle_size = 0
 
     def count_backup_meta(self) -> int:
-        """统计备份元信息总数"""
-        conn = self._get_conn()
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM backup_meta")
-            return cur.fetchone()[0]
+        """统计备份元信息总数（P1-6: O(1) 内存查询）"""
+        self._ensure_stats_loaded()
+        with self._stats_lock:
+            return self._stats_backup_count or 0
 
     def sum_backup_size(self) -> int:
-        """统计所有备份文件的总大小"""
-        conn = self._get_conn()
-        with conn.cursor() as cur:
-            cur.execute("SELECT IFNULL(SUM(file_size), 0) FROM backup_meta")
-            return cur.fetchone()[0]
+        """统计所有备份文件的总大小（P1-6: O(1) 内存查询）"""
+        self._ensure_stats_loaded()
+        with self._stats_lock:
+            return self._stats_backup_size or 0
 
     def count_recycle_meta(self) -> int:
-        """统计回收站元信息总数"""
-        conn = self._get_conn()
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM recycle_meta")
-            return cur.fetchone()[0]
+        """统计回收站元信息总数（P1-6: O(1) 内存查询）"""
+        self._ensure_stats_loaded()
+        with self._stats_lock:
+            return self._stats_recycle_count or 0
 
     def sum_recycle_size(self) -> int:
-        """统计回收站文件总大小"""
-        conn = self._get_conn()
-        with conn.cursor() as cur:
-            cur.execute("SELECT IFNULL(SUM(file_size), 0) FROM recycle_meta")
-            return cur.fetchone()[0]
+        """统计回收站文件总大小（P1-6: O(1) 内存查询）"""
+        self._ensure_stats_loaded()
+        with self._stats_lock:
+            return self._stats_recycle_size or 0
 
     # ── 回收站 meta 操作 ────────────────────────────────────
 
@@ -407,7 +621,7 @@ class Database:
                             is_directory: bool, deletion_time: float,
                             deletion_time_str: str, file_size: int,
                             file_hash: str, original_mtime: float):
-        """插入回收站元信息"""
+        """插入回收站元信息（+ P1-6 增量统计）"""
         conn = self._get_conn()
         with conn.cursor() as cur:
             cur.execute("""
@@ -420,6 +634,8 @@ class Database:
                   int(is_directory), deletion_time, deletion_time_str,
                   file_size, file_hash, original_mtime))
         conn.commit()
+        # P1-6: 增量更新回收站统计
+        self._adjust_recycle_stats(1, file_size)
 
     def get_recycle_meta(self, recycle_path: str) -> Optional[Dict]:
         """查询单条回收站元信息"""
@@ -479,30 +695,87 @@ class Database:
         return rows, total
 
     def delete_recycle_meta(self, recycle_path: str):
-        """删除回收站元信息"""
+        """删除回收站元信息（+ P1-6 增量统计）"""
         conn = self._get_conn()
+        # 查询旧值
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT file_size FROM recycle_meta WHERE recycle_path=%s",
+                (recycle_path,)
+            )
+            old_row = cur.fetchone()
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM recycle_meta WHERE recycle_path=%s",
                 (recycle_path,)
             )
         conn.commit()
+        if old_row is not None:
+            self._adjust_recycle_stats(-1, -(old_row[0] or 0))
 
-    def delete_expired_recycle_meta(self, cutoff: float) -> List[Dict]:
-        """删除过期的回收站元信息，返回被删除的记录列表"""
+    def delete_expired_recycle_meta(self, cutoff: float,
+                                     batch_size: int = 1000):
+        """
+        分批删除过期的回收站元信息（生成器），避免百万级记录一次性加载到内存。
+        每次 yield 一批被删除的记录 List[Dict]，调用方逐批处理即可。
+        """
         conn = self._get_conn()
-        # 先查出要删除的记录
-        with conn.cursor(DictCursor) as cur:
-            cur.execute(
-                "SELECT * FROM recycle_meta WHERE deletion_time < %s",
-                (cutoff,)
-            )
-            rows = cur.fetchall()
-        if rows:
+        total_deleted = 0
+        while True:
+            # 每批先查询被删记录的 file_size（用于增量统计）
+            with conn.cursor(DictCursor) as cur:
+                cur.execute(
+                    "SELECT recycle_path, relative_path, file_size "
+                    "FROM recycle_meta WHERE deletion_time < %s LIMIT %s",
+                    (cutoff, batch_size)
+                )
+                rows = cur.fetchall()
+            if not rows:
+                break
+            recycle_paths = [r["recycle_path"] for r in rows]
+            batch_size_sum = sum(r.get("file_size", 0) or 0 for r in rows)
+            # 分批 DELETE
             with conn.cursor() as cur:
                 cur.execute(
-                    "DELETE FROM recycle_meta WHERE deletion_time < %s",
-                    (cutoff,)
+                    "DELETE FROM recycle_meta WHERE deletion_time < %s LIMIT %s",
+                    (cutoff, batch_size)
                 )
             conn.commit()
-        return rows
+            # P1-6: 增量更新回收站统计
+            self._adjust_recycle_stats(-len(rows), -batch_size_sum)
+            total_deleted += len(rows)
+            yield rows
+            if len(rows) < batch_size:
+                break
+
+    # ── P1-6: 回收站统计增量更新 ─────────────────────────────
+
+    def _adjust_recycle_stats(self, count_delta: int, size_delta: int):
+        """原子更新 MySQL stats 表 + 内存缓存（回收站统计）"""
+        with self._stats_lock:
+            if self._stats_recycle_count is not None:
+                self._stats_recycle_count += count_delta
+                self._stats_recycle_size += size_delta
+        try:
+            conn = self._get_conn()
+            with conn.cursor() as cur:
+                if count_delta != 0:
+                    cur.execute(
+                        "INSERT INTO stats (name, value) VALUES "
+                        "('recycle_count', %s) "
+                        "ON DUPLICATE KEY UPDATE "
+                        "value = value + %s",
+                        (count_delta, count_delta)
+                    )
+                if size_delta != 0:
+                    cur.execute(
+                        "INSERT INTO stats (name, value) VALUES "
+                        "('recycle_size', %s) "
+                        "ON DUPLICATE KEY UPDATE "
+                        "value = value + %s",
+                        (size_delta, size_delta)
+                    )
+            conn.commit()
+        except Exception:
+            with self._stats_lock:
+                self._stats_recycle_count = None

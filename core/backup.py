@@ -393,6 +393,7 @@ def backup_full_tree(config: Config, logger, max_workers: int = 8) -> int:
     - 边遍历边备份，每攒够一批（2000 个）就提交线程池
     - 不会将所有文件路径一次性加载到内存
     - 8 线程并行复制（移除全局锁后真正并行）
+    - 信号量限制最大在途任务数，防止 pending_futures 无限增长导致 OOM
 
     返回备份的文件数量。
     """
@@ -400,6 +401,8 @@ def backup_full_tree(config: Config, logger, max_workers: int = 8) -> int:
     failed = 0
     total_found = 0
     _BATCH_SIZE = 2000
+    # 最大在途任务数：防止亿级文件时 pending_futures 无限增长
+    _MAX_IN_FLIGHT = max_workers * 500  # 8 workers → 4000 在途
 
     for watch_path in config.watch_paths:
         if not os.path.exists(watch_path):
@@ -408,9 +411,10 @@ def backup_full_tree(config: Config, logger, max_workers: int = 8) -> int:
 
         logger.info(f"初始备份: 开始流式遍历 {watch_path} (workers={max_workers})")
 
-        # 流式遍历：攒够一批就提交，不一次性加载所有路径
         batch = []
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            # 信号量：限制在途任务数，防止内存无限增长
+            in_flight_sem = threading.Semaphore(_MAX_IN_FLIGHT)
             pending_futures = []
 
             for root, dirs, files in os.walk(watch_path):
@@ -424,17 +428,21 @@ def backup_full_tree(config: Config, logger, max_workers: int = 8) -> int:
                     if not _should_exclude(rel, config):
                         batch.append(full_path)
 
-                    # 攒够一批，提交线程池
                     if len(batch) >= _BATCH_SIZE:
+                        # 获取信号量：超出限制时阻塞等待已完成任务释放
+                        for _ in batch:
+                            in_flight_sem.acquire()
                         futures = [
                             pool.submit(backup_file, fp, config, logger)
                             for fp in batch
                         ]
+                        for f in futures:
+                            f.add_done_callback(lambda _: in_flight_sem.release())
                         pending_futures.extend(futures)
                         total_found += len(batch)
                         batch.clear()
 
-                        # 收割已完成的 future，避免内存积压
+                        # 收割已完成的 future
                         done_futures = [f for f in pending_futures if f.done()]
                         for f in done_futures:
                             try:
@@ -454,15 +462,20 @@ def backup_full_tree(config: Config, logger, max_workers: int = 8) -> int:
                         if done_total % 5000 < _BATCH_SIZE:
                             logger.info(
                                 f"初始备份进度: 已发现 {total_found} 个文件, "
-                                f"已备份 {count}, 失败 {failed}"
+                                f"已备份 {count}, 失败 {failed}, "
+                                f"在途 {len(pending_futures)}"
                             )
 
             # 处理最后一批
             if batch:
+                for _ in batch:
+                    in_flight_sem.acquire()
                 futures = [
                     pool.submit(backup_file, fp, config, logger)
                     for fp in batch
                 ]
+                for f in futures:
+                    f.add_done_callback(lambda _: in_flight_sem.release())
                 pending_futures.extend(futures)
                 total_found += len(batch)
                 batch.clear()
@@ -479,7 +492,6 @@ def backup_full_tree(config: Config, logger, max_workers: int = 8) -> int:
                     failed += 1
                     logger.error(f"初始备份异常: {e}")
 
-        # 刷新残余元信息缓冲
         _flush_meta_buffer()
 
     logger.info(

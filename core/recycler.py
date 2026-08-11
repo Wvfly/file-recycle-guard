@@ -398,24 +398,25 @@ def cleanup_expired(config: Config, logger) -> int:
     # 优先从数据库清理
     if db is not None:
         try:
-            expired_records = db.delete_expired_recycle_meta(cutoff)
-            for meta in expired_records:
-                recycle_path = meta.get("recycle_path", "")
-                recycle_full = os.path.join(config.recycle_dir, recycle_path)
-                try:
-                    if os.path.exists(recycle_full):
-                        if os.path.isdir(recycle_full):
-                            shutil.rmtree(recycle_full)
-                        else:
-                            os.remove(recycle_full)
-                    # 清理旧的 .meta 文件（兼容旧数据）
-                    meta_old = recycle_full + ".meta"
-                    if os.path.exists(meta_old):
-                        os.remove(meta_old)
-                    cleaned += 1
-                    logger.debug(f"清理过期回收项: {meta.get('relative_path')}")
-                except Exception as e:
-                    logger.error(f"清理失败: {e}")
+            # delete_expired_recycle_meta 现在是生成器，分批 yield 记录
+            for batch in db.delete_expired_recycle_meta(cutoff):
+                for meta in batch:
+                    recycle_path = meta.get("recycle_path", "")
+                    recycle_full = os.path.join(config.recycle_dir, recycle_path)
+                    try:
+                        if os.path.exists(recycle_full):
+                            if os.path.isdir(recycle_full):
+                                shutil.rmtree(recycle_full)
+                            else:
+                                os.remove(recycle_full)
+                        # 清理旧的 .meta 文件（兼容旧数据）
+                        meta_old = recycle_full + ".meta"
+                        if os.path.exists(meta_old):
+                            os.remove(meta_old)
+                        cleaned += 1
+                        logger.debug(f"清理过期回收项: {meta.get('relative_path')}")
+                    except Exception as e:
+                        logger.error(f"清理失败: {e}")
             if cleaned > 0:
                 logger.info(f"已清理 {cleaned} 个过期回收项")
             return cleaned
@@ -492,7 +493,9 @@ def empty_recycle(config: Config, logger) -> int:
     db = get_db()
     if db is not None:
         try:
-            db.delete_expired_recycle_meta(time.time() + 86400)  # 删除所有记录
+            # delete_expired_recycle_meta 现在是生成器，消费即可
+            for _ in db.delete_expired_recycle_meta(time.time() + 86400):
+                pass
         except Exception:
             pass
 

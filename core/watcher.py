@@ -7,6 +7,7 @@ import time
 import fnmatch
 import threading
 from collections import deque
+from typing import Dict, Tuple
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 from .config import Config
@@ -33,9 +34,10 @@ class RecycleGuardHandler(FileSystemEventHandler):
         super().__init__()
         self.config = config
         self.logger = logger
-        # 去重队列：避免短时间内重复事件（Windows 上 modify 可能触发多次）
-        # 扩容到 5000，应对大批量删除场景
-        self._recent_events: deque = deque(maxlen=5000)
+        # 去重字典：同一文件同一事件 2 秒内只处理一次（O(1) 查找替代原 O(n) deque 扫描）
+        # key: (src_path, event_type) → value: timestamp
+        self._recent_events: Dict[Tuple[str, str], float] = {}
+        self._recent_events_lock = threading.Lock()
         # 待确认的删除事件：(路径, 是否目录, 事件时间)
         self._pending_deletes: deque = deque()
         # 用 set 加速路径查找（O(1) 替代 O(n) 线性搜索）
@@ -48,19 +50,50 @@ class RecycleGuardHandler(FileSystemEventHandler):
             name="PendingDeleteWorker"
         )
         self._delete_worker.start()
+        # 批量延迟备份：on_created 只记录路径，后台线程定期批量处理
+        # 解决大批量文件拷贝时线程池队列积压导致 watchdog 事件丢失的问题
+        self._pending_created: set = set()  # 待备份的创建文件路径
+        self._created_sizes: Dict[str, int] = {}  # 上次检查的文件大小
+        self._created_lock = threading.Lock()
+        # 失败重试跟踪：path → (retry_count, next_retry_time)
+        self._retry_queue: Dict[str, Tuple[int, float]] = {}
+        self._batch_backup_worker = threading.Thread(
+            target=self._batch_backup_loop,
+            daemon=True,
+            name="BatchBackupWorker"
+        )
+        self._batch_backup_worker.start()
+
+    def _cleanup_file_tracking(self, src_path: str):
+        """清除文件的所有跟踪条目（P2-15: 防止 _created_sizes 内存泄漏）"""
+        self._created_sizes.pop(src_path, None)
+        self._created_sizes.pop(f"__stable__{src_path}", None)
+        self._created_sizes.pop(f"__first_seen__{src_path}", None)
+        self._retry_queue.pop(src_path, None)
 
     def _is_duplicate(self, src_path: str, event_type: str) -> bool:
-        """简单去重：同一文件同一事件 2 秒内只处理一次"""
+        """去重：同一文件同一事件 2 秒内只处理一次（O(1) dict 查找）。
+        
+        关键改进：不同事件类型之间不互斥（如 created → modified 应放行），
+        因为 on_created 时文件可能未写完，需要 on_modified 补上正确备份。
+        """
         now = time.time()
         key = (src_path, event_type)
-        # 清理过期项
-        while self._recent_events and self._recent_events[0][0] < now - 3:
-            self._recent_events.popleft()
-        # 检查是否重复
-        for t, k in self._recent_events:
-            if k == key and now - t < 2:
+        with self._recent_events_lock:
+            # 检查是否重复（仅同类型事件才拦截）
+            prev_time = self._recent_events.get(key)
+            if prev_time is not None and now - prev_time < 2:
                 return True
-        self._recent_events.append((now, key))
+            # 记录本次事件
+            self._recent_events[key] = now
+            # 定期清理过期项（超过 1000 条时触发，避免字典无限增长）
+            if len(self._recent_events) > 1000:
+                expired = [
+                    k for k, t in self._recent_events.items()
+                    if now - t > 3
+                ]
+                for k in expired:
+                    del self._recent_events[k]
         return False
 
     def _is_pending_delete(self, src_path: str) -> bool:
@@ -107,9 +140,192 @@ class RecycleGuardHandler(FileSystemEventHandler):
             return
 
         self.logger.debug(f"文件创建: {event.src_path}")
-        # 不在事件分发线程中 sleep；若文件尚未写入完成，
-        # 后续 modified 事件会通过哈希比较自动补上正确内容
-        backup_file(event.src_path, self.config, self.logger)
+        # 只记录路径，不阻塞事件分发线程
+        # 后台批量处理线程会定期检查文件稳定性并备份
+        with self._created_lock:
+            self._pending_created.add(event.src_path)
+            self._created_sizes.pop(event.src_path, None)  # 重置大小记录
+
+    def _batch_backup_loop(self):
+        """
+        后台批量备份工作线程。
+        
+        每隔 _BATCH_BACKUP_INTERVAL 秒扫描一次待备份文件，
+        对已稳定的文件执行备份，不稳定的继续等待。
+        
+        优势：
+        - on_created 只记录路径（O(1)），不阻塞 watchdog 事件队列
+        - 单线程轮询所有待备份文件，无线程池队列积压问题
+        - 大文件和小文件互不阻塞
+        """
+        _BATCH_BACKUP_INTERVAL = 3.0  # 扫描间隔（秒）
+        _STABLE_THRESHOLD = 2  # 连续稳定次数
+        _MAX_AGE = 600.0  # 文件最大等待时间（秒），超时强制备份
+
+        while True:
+            try:
+                self._process_pending_created(
+                    _STABLE_THRESHOLD, _MAX_AGE
+                )
+            except Exception as e:
+                self.logger.error(f"批量备份循环异常: {e}")
+
+            time.sleep(_BATCH_BACKUP_INTERVAL)
+
+    def _process_pending_created(self, stable_threshold: int,
+                                  max_age: float):
+        """处理一批待备份的创建文件"""
+        now = time.time()
+        to_backup = []
+        still_waiting = []
+
+        with self._created_lock:
+            for src_path in list(self._pending_created):
+                try:
+                    if not os.path.isfile(src_path):
+                        # 文件已不存在，清除所有跟踪条目（P2-15）
+                        self._cleanup_file_tracking(src_path)
+                        continue
+
+                    # 优先检查重试延迟：未到重试时间的文件继续等待
+                    retry_info = self._retry_queue.get(src_path)
+                    if retry_info is not None:
+                        _, retry_time = retry_info
+                        if now < retry_time:
+                            still_waiting.append(src_path)
+                            continue
+                        # 重试时间已到，清除重试记录，正常处理
+                        self._retry_queue.pop(src_path, None)
+                        # 重置稳定计数，防止之前的高计数导致立即备份
+                        self._created_sizes[f"__stable__{src_path}"] = 0
+
+                    current_size = os.path.getsize(src_path)
+                    prev_size = self._created_sizes.get(src_path, -1)
+                    first_seen = self._created_sizes.get(
+                        f"__first_seen__{src_path}", now
+                    )
+
+                    if current_size == prev_size and current_size > 0:
+                        # 大小未变，增加稳定计数
+                        stable = self._created_sizes.get(
+                            f"__stable__{src_path}", 0
+                        ) + 1
+                        self._created_sizes[f"__stable__{src_path}"] = stable
+
+                        if stable >= stable_threshold:
+                            to_backup.append(src_path)
+                            continue
+                    else:
+                        # 大小变了，重置稳定计数
+                        self._created_sizes[f"__stable__{src_path}"] = 0
+                        self._created_sizes[f"__first_seen__{src_path}"] = now
+
+                    self._created_sizes[src_path] = current_size
+
+                    # 检查是否超时
+                    if now - first_seen >= max_age:
+                        to_backup.append(src_path)
+                    else:
+                        still_waiting.append(src_path)
+
+                except OSError:
+                    # 文件不可访问，继续等待
+                    still_waiting.append(src_path)
+
+            # 更新待处理集合
+            self._pending_created.clear()
+            for p in still_waiting:
+                self._pending_created.add(p)
+
+        # 批量执行备份（在锁外执行，避免阻塞事件记录）
+        backed_up = 0
+        failed_retry = []
+        for src_path in to_backup:
+            try:
+                result = backup_file(src_path, self.config, self.logger)
+                if result == "backed_up":
+                    backed_up += 1
+                    # 备份成功，清除所有跟踪条目（P2-15: 防止内存泄漏）
+                    self._cleanup_file_tracking(src_path)
+                elif result in ("failed", "source_gone"):
+                    # 失败文件加入重试队列（最多 3 次，间隔递增）
+                    retry_count, _ = self._retry_queue.get(src_path, (0, 0))
+                    retry_count += 1
+                    if retry_count <= 3:
+                        # 指数退避：5s, 15s, 45s
+                        delay = 5 * (3 ** (retry_count - 1))
+                        self._retry_queue[src_path] = (
+                            retry_count, now + delay
+                        )
+                        failed_retry.append(src_path)
+                        # 重置稳定计数，防止下次循环立即再次备份
+                        with self._created_lock:
+                            self._created_sizes[
+                                f"__stable__{src_path}"
+                            ] = 0
+                        self.logger.warning(
+                            f"批量备份失败，第{retry_count}次重试"
+                            f"({delay}s后): {src_path}"
+                        )
+                    else:
+                        self.logger.error(
+                            f"批量备份最终失败（已重试3次）: {src_path}"
+                        )
+                        # 最终失败，清除所有跟踪条目（P2-15: 防止内存泄漏）
+                        self._cleanup_file_tracking(src_path)
+                # "skipped" 和 "dirty" 是正常情况，不记录
+            except Exception as e:
+                self.logger.error(f"批量备份异常: {e} - {src_path}")
+
+        # 处理重试队列：失败文件放回待处理集合
+        with self._created_lock:
+            for src_path in failed_retry:
+                self._pending_created.add(src_path)
+
+        if backed_up > 0:
+            self.logger.info(
+                f"批量备份完成: {backed_up}/{len(to_backup)} 个文件"
+            )
+        elif to_backup:
+            self.logger.debug(
+                f"批量备份完成: 0/{len(to_backup)} 个文件"
+            )
+
+    def _wait_file_stable(self, src_path: str,
+                          check_interval: float = 2.0,
+                          stable_count: int = 2,
+                          timeout: float = 600.0) -> bool:
+        """
+        等待文件大小稳定（连续 stable_count 次大小不变）。
+        保留此方法供其他模块（如 sync）使用。
+        """
+        start_time = time.time()
+        last_size = -1
+        stable = 0
+
+        while time.time() - start_time < timeout:
+            try:
+                if not os.path.isfile(src_path):
+                    return False
+                current_size = os.path.getsize(src_path)
+            except OSError:
+                time.sleep(check_interval)
+                continue
+
+            if current_size == last_size and current_size > 0:
+                stable += 1
+                if stable >= stable_count:
+                    return True
+            else:
+                stable = 0
+                last_size = current_size
+
+            time.sleep(check_interval)
+
+        self.logger.debug(
+            f"文件稳定等待超时({timeout}s)，尝试备份: {src_path}"
+        )
+        return os.path.isfile(src_path)
 
     def on_modified(self, event: FileSystemEvent):
         if event.is_directory or self._should_exclude(event.src_path):
@@ -119,7 +335,11 @@ class RecycleGuardHandler(FileSystemEventHandler):
             return
 
         self.logger.debug(f"文件修改: {event.src_path}")
-        backup_file(event.src_path, self.config, self.logger)
+        # P2-14: 与 on_created 合并为统一的批量备份路径，
+        # 避免同步调用 backup_file 阻塞 watchdog 事件分发线程
+        with self._created_lock:
+            self._pending_created.add(event.src_path)
+            self._created_sizes.pop(event.src_path, None)  # 重置大小记录
 
     def on_deleted(self, event: FileSystemEvent):
         if self._should_exclude(event.src_path):
@@ -165,9 +385,11 @@ class RecycleGuardHandler(FileSystemEventHandler):
         # 如果文件又被重新创建了，说明这是"保存覆盖"操作，不是真删除
         if os.path.exists(src_path):
             self.logger.debug(f"删除事件取消（文件已重建）: {src_path}")
-            # 新文件已创建，触发备份
+            # P2-14: 记录到批量备份队列，避免同步阻塞 delete worker
             if not is_directory:
-                backup_file(src_path, self.config, self.logger)
+                with self._created_lock:
+                    self._pending_created.add(src_path)
+                    self._created_sizes.pop(src_path, None)
             return
 
         # 确认真删除：等待正在进行的备份完成，再移入回收站
@@ -203,9 +425,11 @@ class RecycleGuardHandler(FileSystemEventHandler):
 
         self.logger.debug(f"文件移动/重命名: {event.src_path} -> {event.dest_path}")
 
-        # 目标文件：备份
+        # P2-14: 目标文件记录到批量备份队列，避免同步阻塞 watchdog 事件线程
         if not event.is_directory and os.path.isfile(event.dest_path):
-            backup_file(event.dest_path, self.config, self.logger)
+            with self._created_lock:
+                self._pending_created.add(event.dest_path)
+                self._created_sizes.pop(event.dest_path, None)
 
         # 目标仍在监控目录内：只是重命名/移动，不算删除
         if self.config.find_watch_root(event.dest_path) is not None:
@@ -251,3 +475,4 @@ def start_watcher(config: Config, logger):
     ).start()
 
     return observer, handler
+
