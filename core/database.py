@@ -57,7 +57,7 @@ class Database:
             "password": password,
             "database": database,
             "charset": "utf8mb4",
-            "autocommit": False,
+            "autocommit": True,
         }
         self._local = threading.local()
         self._lock = threading.Lock()
