@@ -1,5 +1,11 @@
 """
 文件系统监控模块 - 使用 watchdog 监控共享文件夹变更
+
+架构定位（方案第二十二节）：
+- USN Journal = 主通道（source of truth）
+- watchdog = 低延迟加速器（100ms 级延迟 vs USN 1s 轮询）
+- 当 USN 可用时，watchdog 事件送入 UsnDetector 管道统一处理
+- 当 USN 不可用时，watchdog 作为主通道（回退模式）
 """
 
 import os
@@ -25,15 +31,17 @@ class RecycleGuardHandler(FileSystemEventHandler):
     """
     文件系统事件处理器。
 
-    策略：
-    - on_created / on_modified → 备份到镜像目录
-    - on_deleted → 从镜像目录移动到回收站
+    双模式运行：
+    - USN 模式（默认）：事件送入 UsnDetector 管道，由 EventNormalizer 统一处理
+    - 回退模式（USN 不可用）：直接执行备份/删除操作
     """
 
-    def __init__(self, config: Config, logger):
+    def __init__(self, config: Config, logger, usn_detector=None):
         super().__init__()
         self.config = config
         self.logger = logger
+        self.usn_detector = usn_detector  # USN 检测器（可选）
+        self._usn_active = usn_detector is not None
         # 去重字典：同一文件同一事件 2 秒内只处理一次（O(1) 查找替代原 O(n) deque 扫描）
         # key: (src_path, event_type) → value: timestamp
         self._recent_events: Dict[Tuple[str, str], float] = {}
@@ -140,11 +148,18 @@ class RecycleGuardHandler(FileSystemEventHandler):
             return
 
         self.logger.debug(f"文件创建: {event.src_path}")
-        # 只记录路径，不阻塞事件分发线程
-        # 后台批量处理线程会定期检查文件稳定性并备份
+
+        # USN 模式：事件送入检测器管道
+        if self._usn_active and self.usn_detector:
+            self.usn_detector.submit_watchdog_event(
+                "created", event.src_path, event.is_directory
+            )
+            return
+
+        # 回退模式：直接记录到批量备份队列
         with self._created_lock:
             self._pending_created.add(event.src_path)
-            self._created_sizes.pop(event.src_path, None)  # 重置大小记录
+            self._created_sizes.pop(event.src_path, None)
 
     def _batch_backup_loop(self):
         """
@@ -335,11 +350,18 @@ class RecycleGuardHandler(FileSystemEventHandler):
             return
 
         self.logger.debug(f"文件修改: {event.src_path}")
-        # P2-14: 与 on_created 合并为统一的批量备份路径，
-        # 避免同步调用 backup_file 阻塞 watchdog 事件分发线程
+
+        # USN 模式：事件送入检测器管道
+        if self._usn_active and self.usn_detector:
+            self.usn_detector.submit_watchdog_event(
+                "modified", event.src_path, event.is_directory
+            )
+            return
+
+        # 回退模式：记录到批量备份队列
         with self._created_lock:
             self._pending_created.add(event.src_path)
-            self._created_sizes.pop(event.src_path, None)  # 重置大小记录
+            self._created_sizes.pop(event.src_path, None)
 
     def on_deleted(self, event: FileSystemEvent):
         if self._should_exclude(event.src_path):
@@ -425,11 +447,18 @@ class RecycleGuardHandler(FileSystemEventHandler):
 
         self.logger.debug(f"文件移动/重命名: {event.src_path} -> {event.dest_path}")
 
-        # P2-14: 目标文件记录到批量备份队列，避免同步阻塞 watchdog 事件线程
-        if not event.is_directory and os.path.isfile(event.dest_path):
-            with self._created_lock:
-                self._pending_created.add(event.dest_path)
-                self._created_sizes.pop(event.dest_path, None)
+        # USN 模式：目标路径送入检测器管道
+        if self._usn_active and self.usn_detector:
+            if not event.is_directory and os.path.isfile(event.dest_path):
+                self.usn_detector.submit_watchdog_event(
+                    "moved", event.dest_path, event.is_directory
+                )
+        else:
+            # 回退模式：目标文件记录到批量备份队列
+            if not event.is_directory and os.path.isfile(event.dest_path):
+                with self._created_lock:
+                    self._pending_created.add(event.dest_path)
+                    self._created_sizes.pop(event.dest_path, None)
 
         # 目标仍在监控目录内：只是重命名/移动，不算删除
         if self.config.find_watch_root(event.dest_path) is not None:
@@ -447,13 +476,18 @@ class RecycleGuardHandler(FileSystemEventHandler):
                 self._pending_paths.add(event.src_path)
 
 
-def start_watcher(config: Config, logger):
+def start_watcher(config: Config, logger, usn_detector=None):
     """
     启动文件监控。
 
+    Args:
+        config: Config 实例
+        logger: Logger 实例
+        usn_detector: UsnDetector 实例（可选，USN 模式下使用）
+
     返回 (observer, handler) 元组。
     """
-    handler = RecycleGuardHandler(config, logger)
+    handler = RecycleGuardHandler(config, logger, usn_detector=usn_detector)
     observer = Observer()
 
     for watch_path in config.watch_paths:

@@ -40,6 +40,16 @@ class SyncConfig:
 
 
 @dataclass
+class UsnConfig:
+    """USN Journal 配置 - 基于 NTFS USN Journal 的增量变更检测"""
+    enabled: bool = True
+    poll_interval: float = 1.0       # 轮询间隔（秒）
+    state_dir: str = ".usn_state"    # checkpoint 状态目录
+    max_records_per_read: int = 10000  # 单次最大读取记录数
+    buffer_size_mb: int = 4          # USN 读取缓冲区大小（MB）
+
+
+@dataclass
 class DatabaseConfig:
     """MySQL 数据库配置 - 存储备份和回收站元信息"""
     host: str = "127.0.0.1"
@@ -84,6 +94,7 @@ class Config:
     web: WebConfig = field(default_factory=WebConfig)
     mirror_cleanup: MirrorCleanupConfig = field(default_factory=MirrorCleanupConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
+    usn: UsnConfig = field(default_factory=UsnConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
 
 
@@ -195,6 +206,19 @@ def load_config(config_path: str = "config.yaml") -> Config:
             config.sync.enabled = sync_raw["enabled"]
         if "interval" in sync_raw:
             config.sync.interval = sync_raw["interval"]
+
+    if "usn" in raw:
+        usn_raw = raw["usn"]
+        if "enabled" in usn_raw:
+            config.usn.enabled = usn_raw["enabled"]
+        if "poll_interval" in usn_raw:
+            config.usn.poll_interval = float(usn_raw["poll_interval"])
+        if "state_dir" in usn_raw:
+            config.usn.state_dir = usn_raw["state_dir"]
+        if "max_records_per_read" in usn_raw:
+            config.usn.max_records_per_read = int(usn_raw["max_records_per_read"])
+        if "buffer_size_mb" in usn_raw:
+            config.usn.buffer_size_mb = int(usn_raw["buffer_size_mb"])
 
     if "database" in raw:
         db_raw = raw["database"]

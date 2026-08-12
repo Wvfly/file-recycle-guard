@@ -26,6 +26,16 @@ from core.cleanup import start_cleanup
 from core.sync import start_sync
 from web import start_web
 
+# USN 架构组件（延迟导入，避免非 Windows 平台报错）
+_usn_available = False
+try:
+    from core.detector.usn_detector import UsnDetector
+    from core.detector.reconciler import Reconciler
+    from core.usn.event_store import UsnEventStore
+    _usn_available = True
+except ImportError:
+    pass
+
 
 class RecycleGuard:
     """守护程序主控制器"""
@@ -43,6 +53,10 @@ class RecycleGuard:
         self.web_thread = None
         self.running = False
         self.lock = threading.Lock()
+        # USN 组件
+        self.usn_detector = None
+        self.reconciler = None
+        self.event_store = None
 
     def start(self):
         """启动所有服务"""
@@ -84,8 +98,13 @@ class RecycleGuard:
                     os.makedirs(d, exist_ok=True)
                     self.logger.info(f"创建目录: {d}")
 
-            # 启动文件监控
-            self.observer, self.handler = start_watcher(self.config, self.logger)
+            # 初始化 USN 检测器（如果可用）
+            usn_detector = self._init_usn_detector()
+
+            # 启动文件监控（传入 usn_detector，USN 模式下作为加速器）
+            self.observer, self.handler = start_watcher(
+                self.config, self.logger, usn_detector=usn_detector
+            )
 
             # 启动定期清理
             self.cleanup_thread, self.cleanup_stop = start_cleanup(
@@ -97,10 +116,16 @@ class RecycleGuard:
                 self.config, self.logger
             )
 
-            # 启动 Web 界面
-            self.web_thread = start_web(self.config, self.logger)
+            # 启动 Web 界面（注入 USN 检测器供 /api/usn_health 使用）
+            self.web_thread = start_web(
+                self.config, self.logger, usn_detector=usn_detector
+            )
 
             self.running = True
+            if usn_detector:
+                self.logger.info("运行模式: USN Journal (主通道) + watchdog (加速器)")
+            else:
+                self.logger.info("运行模式: watchdog (主通道)")
             self.logger.info("所有服务已启动，守护程序运行中...")
 
     def stop(self):
@@ -110,6 +135,20 @@ class RecycleGuard:
                 return
 
             self.logger.info("正在停止守护程序...")
+
+            # 停止 USN 检测器
+            if self.usn_detector:
+                self.usn_detector.stop()
+                self.logger.info("USN 检测器已停止")
+
+            # 停止 Reconciler
+            if self.reconciler:
+                self.reconciler.stop()
+                self.logger.info("一致性修复器已停止")
+
+            # 停止 EventStore
+            if self.event_store:
+                self.event_store.close()
 
             # 停止文件监控
             if self.observer:
@@ -127,6 +166,66 @@ class RecycleGuard:
 
             self.running = False
             self.logger.info("守护程序已停止")
+
+    def _init_usn_detector(self):
+        """
+        初始化 USN 检测器。
+
+        Returns:
+            UsnDetector 实例（如果 USN 可用），否则 None
+        """
+        if not _usn_available:
+            self.logger.info("USN 模块不可用，使用 watchdog 模式")
+            return None
+
+        if os.name != 'nt':
+            self.logger.info("非 Windows 系统，USN Journal 不可用")
+            return None
+
+        usn_cfg = getattr(self.config, 'usn', None)
+        if usn_cfg and not usn_cfg.enabled:
+            self.logger.info("USN Journal 已在配置中禁用")
+            return None
+
+        try:
+            # 初始化 USN 事件存储（SQLite）
+            state_dir = usn_cfg.state_dir if usn_cfg else ".usn_state"
+            db_path = os.path.join(state_dir, "usn_state.db")
+            self.event_store = UsnEventStore(db_path)
+
+            # 创建 USN 检测器
+            self.usn_detector = UsnDetector(
+                config=self.config,
+                logger=self.logger,
+                event_store=self.event_store,
+            )
+
+            # 创建 Reconciler
+            self.reconciler = Reconciler(
+                config=self.config,
+                logger=self.logger,
+                event_store=self.event_store,
+            )
+
+            # 设置 reconciliation 回调
+            self.usn_detector.set_on_reconcile(
+                lambda vol, reason: self.reconciler.trigger_reconcile(vol, reason)
+            )
+
+            # 启动 Reconciler
+            self.reconciler.start()
+
+            # 启动 USN 检测器
+            if self.usn_detector.start():
+                self.logger.info("USN Journal 检测器已启动")
+                return self.usn_detector
+            else:
+                self.logger.warning("USN Journal 初始化失败，回退到 watchdog 模式")
+                return None
+
+        except Exception as e:
+            self.logger.error(f"USN 检测器初始化失败: {e}")
+            return None
 
     def run_forever(self):
         """启动并持续运行，直到收到停止信号"""

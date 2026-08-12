@@ -215,6 +215,42 @@ class Database:
                     value BIGINT NOT NULL DEFAULT 0
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            # USN 持久化事件队列（方案第二十一节）
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS fs_event (
+                    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    volume_id       VARCHAR(32) NOT NULL,
+                    usn             BIGINT NOT NULL,
+                    file_reference  BIGINT DEFAULT NULL,
+                    parent_reference BIGINT DEFAULT NULL,
+                    reason          INT NOT NULL,
+                    path            VARCHAR(2048) DEFAULT NULL,
+                    event_type      VARCHAR(32) NOT NULL,
+                    state           VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+                    created_at      DOUBLE NOT NULL,
+                    updated_at      DOUBLE NOT NULL,
+                    UNIQUE KEY uk_volume_usn (volume_id, usn),
+                    INDEX idx_state (state)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                  COMMENT='USN 持久化事件队列'
+            """)
+            # 文件身份表（方案第十二节）
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS file_identity (
+                    volume_id               VARCHAR(32) NOT NULL,
+                    file_reference_number   BIGINT NOT NULL,
+                    watch_root              VARCHAR(1024) NOT NULL,
+                    relative_path           VARCHAR(2048) NOT NULL,
+                    is_directory            TINYINT(1) NOT NULL DEFAULT 0,
+                    last_usn                BIGINT NOT NULL,
+                    file_size               BIGINT DEFAULT NULL,
+                    mtime_ns                BIGINT DEFAULT NULL,
+                    state                   VARCHAR(32) NOT NULL DEFAULT 'ACTIVE',
+                    PRIMARY KEY (volume_id, file_reference_number),
+                    INDEX idx_state (state)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                  COMMENT='文件身份追踪（基于 FRN）'
+            """)
             conn.commit()
 
         # 自动迁移：为旧表添加 path_hash 列
@@ -779,3 +815,143 @@ class Database:
         except Exception:
             with self._stats_lock:
                 self._stats_recycle_count = None
+
+    # ── USN 事件队列操作 ──────────────────────────────────
+
+    def batch_insert_fs_events(self, events: List[Dict]):
+        """
+        批量插入事件到 fs_event 表。
+        events: [{"volume_id", "usn", "file_reference", "parent_reference",
+                  "reason", "path", "event_type", "state", "created_at"}, ...]
+        """
+        if not events:
+            return
+        conn = self._get_conn()
+        now = time.time()
+        batch_size = 100
+        for i in range(0, len(events), batch_size):
+            batch = events[i:i + batch_size]
+            placeholders = []
+            values = []
+            for item in batch:
+                placeholders.append(
+                    "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                )
+                values.extend([
+                    item["volume_id"], item["usn"],
+                    item.get("file_reference"), item.get("parent_reference"),
+                    item["reason"], item.get("path"),
+                    item["event_type"], item["state"],
+                    item["created_at"], now,
+                ])
+            sql = (
+                "INSERT INTO fs_event "
+                "(volume_id, usn, file_reference, parent_reference, "
+                "reason, path, event_type, state, created_at, updated_at) "
+                "VALUES " + ", ".join(placeholders) +
+                " ON DUPLICATE KEY UPDATE "
+                "state=VALUES(state), updated_at=VALUES(updated_at)"
+            )
+            with conn.cursor() as cur:
+                cur.execute(sql, values)
+        conn.commit()
+
+    def update_fs_event_state(self, event_id: int, state: str):
+        """更新 fs_event 表中指定事件的状态"""
+        conn = self._get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE fs_event SET state = %s, updated_at = %s "
+                "WHERE id = %s",
+                (state, time.time(), event_id)
+            )
+        conn.commit()
+
+    def reset_processing_events(self) -> int:
+        """
+        crash recovery：将 PROCESSING 状态的事件重置为 PENDING。
+        返回被重置的事件数量。
+        """
+        conn = self._get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE fs_event SET state = 'PENDING', updated_at = %s "
+                "WHERE state = 'PROCESSING'",
+                (time.time(),)
+            )
+            count = cur.rowcount
+        conn.commit()
+        return count
+
+    def fetch_pending_events(self, batch_size: int = 100) -> List[Dict]:
+        """
+        获取一批 PENDING 状态的事件。
+        同时将它们的状态更新为 PROCESSING。
+        """
+        conn = self._get_conn()
+        now = time.time()
+
+        # 先查询 PENDING 事件
+        with conn.cursor(DictCursor) as cur:
+            cur.execute(
+                "SELECT id, volume_id, usn, file_reference, parent_reference, "
+                "reason, path, event_type, created_at "
+                "FROM fs_event WHERE state = 'PENDING' "
+                "ORDER BY id LIMIT %s",
+                (batch_size,)
+            )
+            events = cur.fetchall()
+
+        if not events:
+            return []
+
+        # 更新为 PROCESSING
+        event_ids = [e["id"] for e in events]
+        placeholders = ",".join(["%s"] * len(event_ids))
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE fs_event SET state = 'PROCESSING', updated_at = %s "
+                f"WHERE id IN ({placeholders})",
+                [now] + event_ids
+            )
+        conn.commit()
+
+        return events
+
+    def upsert_file_identity(self, volume_id: str, frn: int,
+                             watch_root: str, relative_path: str,
+                             is_directory: bool, last_usn: int,
+                             file_size: Optional[int] = None,
+                             mtime_ns: Optional[int] = None,
+                             state: str = "ACTIVE"):
+        """插入/更新文件身份记录"""
+        conn = self._get_conn()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO file_identity
+                    (volume_id, file_reference_number, watch_root,
+                     relative_path, is_directory, last_usn,
+                     file_size, mtime_ns, state)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    watch_root = VALUES(watch_root),
+                    relative_path = VALUES(relative_path),
+                    is_directory = VALUES(is_directory),
+                    last_usn = VALUES(last_usn),
+                    file_size = VALUES(file_size),
+                    mtime_ns = VALUES(mtime_ns),
+                    state = VALUES(state)
+            """, (volume_id, frn, watch_root, relative_path,
+                  int(is_directory), last_usn, file_size, mtime_ns, state))
+        conn.commit()
+
+    def get_file_identity(self, volume_id: str, frn: int) -> Optional[Dict]:
+        """查询文件身份记录"""
+        conn = self._get_conn()
+        with conn.cursor(DictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM file_identity "
+                "WHERE volume_id = %s AND file_reference_number = %s",
+                (volume_id, frn)
+            )
+            return cur.fetchone()

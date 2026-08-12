@@ -338,16 +338,80 @@ def create_app(config: Config, logger) -> FastAPI:
 
         return result
 
+    # ── USN Health Check API ─────────────────────────────────────
+
+    # USN 检测器引用（由 main.py 注入）
+    _usn_detector_ref = {"detector": None}
+
+    def set_usn_detector(detector):
+        """注入 USN 检测器引用（由 main.py 在启动时调用）"""
+        _usn_detector_ref["detector"] = detector
+
+    @app.get("/api/usn_health")
+    async def api_usn_health():
+        """USN Journal 健康状态（方案第二十五节）"""
+        detector = _usn_detector_ref.get("detector")
+        if detector is None:
+            return {
+                "available": False,
+                "message": "USN Journal 未启用或不可用",
+                "volumes": [],
+            }
+
+        try:
+            health_list = detector.get_health()
+            stats = detector.get_stats()
+
+            return {
+                "available": True,
+                "volumes": [
+                    {
+                        "volume": h.volume,
+                        "status": h.status.value,
+                        "journal_id": h.journal_id,
+                        "first_usn": h.first_usn,
+                        "current_usn": h.current_usn,
+                        "checkpoint_usn": h.checkpoint_usn,
+                        "lag": h.lag,
+                        "journal_size_bytes": h.journal_size_bytes,
+                        "journal_used_bytes": h.journal_used_bytes,
+                        "coverage_estimate": h.coverage_estimate,
+                    }
+                    for h in health_list
+                ],
+                "stats": stats,
+            }
+        except Exception as e:
+            return {
+                "available": False,
+                "error": str(e),
+                "volumes": [],
+            }
+
+    # 将 set_usn_detector 暴露到 app 对象上
+    app.set_usn_detector = set_usn_detector
+
     return app
 
 
-def start_web(config: Config, logger):
-    """启动 Web 管理界面"""
+def start_web(config: Config, logger, usn_detector=None):
+    """启动 Web 管理界面
+
+    Args:
+        config: Config 实例
+        logger: Logger 实例
+        usn_detector: UsnDetector 实例（可选，用于 /api/usn_health）
+    """
     if not config.web.enabled:
         logger.info("Web 界面已禁用")
         return None
 
     app = create_app(config, logger)
+
+    # 注入 USN 检测器引用
+    if usn_detector is not None:
+        app.set_usn_detector(usn_detector)
+
     logger.info(f"Web 管理界面启动: http://{config.web.host}:{config.web.port}")
 
     import uvicorn
