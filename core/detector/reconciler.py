@@ -182,11 +182,23 @@ class Reconciler:
                 for filename in files:
                     full_path = os.path.join(root, filename)
                     try:
-                        # 仅计数，不写入 file_identity：
-                        # frn=0 会导致 PRIMARY KEY(volume_id, file_reference_number)
-                        # 冲突（所有文件共享同一 PK，只保留最后一条）。
-                        # 真实 FRN 由后续 USN 事件自动填充。
-                        os.stat(full_path)
+                        stat = os.stat(full_path)
+                        rel_path = os.path.relpath(full_path, watch_path)
+                        # Windows NTFS 上 os.stat().st_ino 就是 File Reference Number (FRN)
+                        frn = stat.st_ino
+
+                        if self.event_store:
+                            self.event_store.upsert_file_identity(
+                                volume_id=volume,
+                                frn=frn,
+                                watch_root=watch_path,
+                                relative_path=rel_path,
+                                is_directory=False,
+                                last_usn=0,
+                                file_size=stat.st_size,
+                                mtime_ns=stat.st_mtime_ns,
+                                state="ACTIVE",
+                            )
                         total_files += 1
                     except OSError:
                         continue
@@ -238,7 +250,14 @@ class Reconciler:
 
                 for filename in files:
                     full_path = os.path.join(root, filename)
-                    current_files.add(os.path.normcase(full_path))
+                    try:
+                        stat = os.stat(full_path)
+                        frn = stat.st_ino  # Windows NTFS 上 st_ino 就是 FRN
+                        current_files[os.path.normcase(full_path)] = (
+                            frn, stat.st_size, stat.st_mtime_ns
+                        )
+                    except OSError:
+                        continue
 
         # 3. 标记已删除文件（在 file_identity 中但不在文件系统中）
         deleted_count = 0
@@ -255,13 +274,44 @@ class Reconciler:
                 except Exception:
                     pass
 
-        # 4. 不写入 frn=0 的新文件（与 N1 同理，会导致 PK 冲突）
-        # 新文件由后续 USN 事件自动填充到 file_identity
+        # 4. 添加新发现文件（在文件系统中但不在 file_identity 中），使用真实 FRN
+        known_paths = {
+            os.path.normcase(
+                os.path.join(id_["watch_root"], id_["relative_path"])
+            )
+            for id_ in known_identities.values()
+        }
+        new_count = 0
+        for full_path, (frn, file_size, mtime_ns) in current_files.items():
+            if full_path not in known_paths:
+                watch_root = None
+                for wp in watch_paths:
+                    wp_norm = os.path.normcase(os.path.abspath(wp))
+                    if full_path.startswith(wp_norm + os.sep) or full_path == wp_norm:
+                        watch_root = wp_norm
+                        break
+                if watch_root:
+                    try:
+                        rel = os.path.relpath(full_path, watch_root)
+                        self.event_store.upsert_file_identity(
+                            volume_id=volume,
+                            frn=frn,
+                            watch_root=watch_root,
+                            relative_path=rel,
+                            is_directory=False,
+                            last_usn=0,
+                            file_size=file_size,
+                            mtime_ns=mtime_ns,
+                            state="ACTIVE",
+                        )
+                        new_count += 1
+                    except OSError:
+                        pass
 
         self.logger.info(
             f"全量重扫完成: 卷 {volume}, "
             f"{len(current_files)} 个文件, "
-            f"标记删除 {deleted_count}"
+            f"标记删除 {deleted_count}, 新增 {new_count}"
         )
 
     def _periodic_check(self):
@@ -298,6 +348,17 @@ class Reconciler:
                 self.logger.error(f"查询 file_identity 失败: {e}")
                 continue
 
+            # P0-1 修复：构建 {norm_path: identity} 索引，查找从 O(n) 降为 O(1)
+            identity_by_path = {}
+            for frn, identity in known_identities.items():
+                identity_path = os.path.normcase(
+                    os.path.join(
+                        identity["watch_root"],
+                        identity["relative_path"],
+                    )
+                )
+                identity_by_path[identity_path] = identity
+
             # 扫描文件系统
             for root, dirs, files in os.walk(watch_path):
                 if self._stop_event.is_set():
@@ -312,37 +373,30 @@ class Reconciler:
                     except OSError:
                         continue
 
-                    # 查找对应的 file_identity 记录
-                    for frn, identity in known_identities.items():
-                        identity_path = os.path.normcase(
-                            os.path.join(
-                                identity["watch_root"],
-                                identity["relative_path"],
-                            )
-                        )
-                        if identity_path != full_path:
-                            continue
-                        if identity.get("state") != "ACTIVE":
-                            continue
+                    # O(1) 查找对应的 file_identity 记录
+                    identity = identity_by_path.get(full_path)
+                    if identity is None:
+                        continue
+                    if identity.get("state") != "ACTIVE":
+                        continue
 
-                        # 比对文件大小和修改时间，检测文件被替换
-                        db_size = identity.get("file_size")
-                        db_mtime = identity.get("mtime_ns")
-                        if (db_size is not None
-                                and db_size != stat.st_size):
-                            self.logger.warning(
-                                f"文件被替换检测: {full_path} "
-                                f"(size: {db_size} → {stat.st_size})"
-                            )
-                            inconsistencies += 1
-                        elif (db_mtime is not None
-                                and db_mtime != stat.st_mtime_ns):
-                            self.logger.warning(
-                                f"文件内容变化: {full_path} "
-                                f"(mtime 不一致)"
-                            )
-                            inconsistencies += 1
-                        break
+                    # 比对文件大小和修改时间，检测文件被替换
+                    db_size = identity.get("file_size")
+                    db_mtime = identity.get("mtime_ns")
+                    if (db_size is not None
+                            and db_size != stat.st_size):
+                        self.logger.warning(
+                            f"文件被替换检测: {full_path} "
+                            f"(size: {db_size} → {stat.st_size})"
+                        )
+                        inconsistencies += 1
+                    elif (db_mtime is not None
+                            and db_mtime != stat.st_mtime_ns):
+                        self.logger.warning(
+                            f"文件内容变化: {full_path} "
+                            f"(mtime 不一致)"
+                        )
+                        inconsistencies += 1
 
         if inconsistencies > 0:
             self.logger.warning(
