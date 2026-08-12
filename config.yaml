@@ -58,6 +58,11 @@ sync:
   enabled: true
   # 扫描间隔（秒），建议 30-60 秒
   interval: 30
+  # 缓存目录（文件状态 SQLite 存储位置）
+  # 留空则自动推导为 backup_dir 的父目录 + .cache（如 E:\tmp\.cache）
+  cache_dir: ""
+  # 备份线程数（增量同步 + 初始全量备份共用）
+  backup_workers: 8
 
 # USN Journal 配置 - 基于 NTFS USN Journal 的增量变更检测
 # 本地部署时（file-recycle-guard 与 SMB 文件服务器在同一台机器）推荐使用
@@ -72,6 +77,8 @@ usn:
   max_records_per_read: 10000
   # USN 读取缓冲区大小（MB），高并发场景建议 4-8 MB
   buffer_size_mb: 4
+  # 保护引擎 worker 线程数（处理备份/删除/重命名事件）
+  protection_workers: 4
 
 # MySQL 数据库配置 - 存储备份元信息和回收站元信息
 # 替代原来的 .meta 和 .recycle.json 文件

@@ -987,18 +987,22 @@ def _sync_thread(config: Config, logger, stop_event: threading.Event):
     # 时间预算 = interval - 5秒（留 5 秒给备份操作）
     time_budget = max(5.0, interval - 5.0)
 
-    # 初始化缓存
-    cache_dir = os.path.join(
-        os.path.dirname(os.path.abspath(config.backup_dir)),
-        ".cache"
-    )
+    # 初始化缓存目录：优先使用配置值，否则自动推导（backup_dir 的父目录 + .cache）
+    if config.sync.cache_dir:
+        cache_dir = config.sync.cache_dir
+    else:
+        cache_dir = os.path.join(
+            os.path.dirname(os.path.abspath(config.backup_dir)),
+            ".cache"
+        )
     pcache, mcache, dir_cache = _get_caches(cache_dir)
-    scanner = IncrementalScanner()
+    backup_workers = config.sync.backup_workers
+    scanner = IncrementalScanner(backup_workers=backup_workers)
 
     logger.info(
         f"增量同步引擎已启动: 间隔 {interval}s, "
         f"时间预算 {time_budget:.0f}s, "
-        f"备份线程池 8 workers, 缓存目录 {cache_dir}"
+        f"备份线程池 {backup_workers} workers, 缓存目录 {cache_dir}"
     )
 
     try:

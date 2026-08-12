@@ -37,6 +37,8 @@ class SyncConfig:
     """定期同步配置 - 主动扫描监控目录并备份变更"""
     enabled: bool = True
     interval: int = 30  # 扫描间隔（秒）
+    cache_dir: str = ""  # 缓存目录（空字符串表示自动推导：backup_dir 的父目录 + .cache）
+    backup_workers: int = 8  # 备份线程数（增量同步 + 初始全量备份共用）
 
 
 @dataclass
@@ -47,6 +49,7 @@ class UsnConfig:
     state_dir: str = ".usn_state"    # checkpoint 状态目录
     max_records_per_read: int = 10000  # 单次最大读取记录数
     buffer_size_mb: int = 4          # USN 读取缓冲区大小（MB）
+    protection_workers: int = 4      # 保护引擎 worker 线程数
 
 
 @dataclass
@@ -206,6 +209,10 @@ def load_config(config_path: str = "config.yaml") -> Config:
             config.sync.enabled = sync_raw["enabled"]
         if "interval" in sync_raw:
             config.sync.interval = sync_raw["interval"]
+        if "cache_dir" in sync_raw:
+            config.sync.cache_dir = sync_raw["cache_dir"]
+        if "backup_workers" in sync_raw:
+            config.sync.backup_workers = int(sync_raw["backup_workers"])
 
     if "usn" in raw:
         usn_raw = raw["usn"]
@@ -219,6 +226,8 @@ def load_config(config_path: str = "config.yaml") -> Config:
             config.usn.max_records_per_read = int(usn_raw["max_records_per_read"])
         if "buffer_size_mb" in usn_raw:
             config.usn.buffer_size_mb = int(usn_raw["buffer_size_mb"])
+        if "protection_workers" in usn_raw:
+            config.usn.protection_workers = int(usn_raw["protection_workers"])
 
     if "database" in raw:
         db_raw = raw["database"]

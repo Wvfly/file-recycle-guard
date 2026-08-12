@@ -502,9 +502,11 @@ def start_watcher(config: Config, logger, usn_detector=None):
 
     # 初始备份
     logger.info("执行初始全量备份...")
+    backup_workers = config.sync.backup_workers
     threading.Thread(
         target=backup_full_tree,
         args=(config, logger),
+        kwargs={"max_workers": backup_workers},
         daemon=True
     ).start()
 
