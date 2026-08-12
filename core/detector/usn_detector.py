@@ -126,6 +126,7 @@ class UsnDetector:
             poll_interval=poll_interval,
             buffer_size_mb=buffer_size_mb,
             max_records_per_read=max_records,
+            event_store=self.event_store,  # N4: checkpoint 与 fs_event 绑定
         )
 
         # 设置排除规则

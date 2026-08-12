@@ -86,13 +86,15 @@ class UsnJournalMonitor:
                  checkpoint_db: str = ".usn_state/usn_checkpoint.db",
                  poll_interval: float = 1.0,
                  buffer_size_mb: int = 4,
-                 max_records_per_read: int = 10000):
+                 max_records_per_read: int = 10000,
+                 event_store=None):
         self.watch_paths: List[str] = [os.path.abspath(p) for p in watch_paths]
         self.poll_interval = poll_interval
         self.buffer_size_mb = buffer_size_mb
         self.max_records_per_read = max_records_per_read
 
         self._checkpoint_store = UsnCheckpointStore(checkpoint_db)
+        self._event_store = event_store  # UsnEventStore（可选，用于 checkpoint 绑定）
         self._readers: Dict[str, UsnJournalReader] = {}
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -327,16 +329,42 @@ class UsnJournalMonitor:
                     for event in resolved:
                         self._dispatch_event(event)
 
-                    # TODO(PR4): checkpoint 推进应与 fs_event 持久化绑定（方案第二十节）
-                    # 当前在事件 dispatch 后推进，PR4 集成 ProtectionEngine 后改为
-                    # 在事件成功写入 fs_event 后才推进 checkpoint
+                    # 先持久化事件到 fs_event，再推进 checkpoint（方案第二十节）
+                    # 顺序保证：如果先推进 checkpoint 再写事件，崩溃时 USN 记录丢失
+                    # 如果先写事件再推进 checkpoint，崩溃时最坏情况是重新处理已处理事件
                     if result.last_usn > start_usn:
-                        self._checkpoint_store.update_next_usn(
-                            vol,
-                            result.last_usn,
-                            reader.journal_id,
-                            JournalStatus.HEALTHY,
-                        )
+                        events_persisted = True
+                        if self._event_store is not None:
+                            try:
+                                fs_events = [
+                                    {
+                                        "volume_id": vol,
+                                        "usn": e.usn,
+                                        "file_reference": e.file_reference_number,
+                                        "parent_reference": e.parent_frn,
+                                        "reason": e.reason,
+                                        "path": e.full_path,
+                                        "event_type": "USN",
+                                        "state": "PENDING",
+                                        "created_at": e.timestamp_sec,
+                                    }
+                                    for e in resolved
+                                ]
+                                self._event_store.batch_insert_fs_events(fs_events)
+                            except Exception as persist_err:
+                                if self.logger:
+                                    self.logger.error(
+                                        f"fs_event 持久化失败: {persist_err}"
+                                    )
+                                events_persisted = False
+
+                        if events_persisted:
+                            self._checkpoint_store.update_next_usn(
+                                vol,
+                                result.last_usn,
+                                reader.journal_id,
+                                JournalStatus.HEALTHY,
+                            )
 
                 except Exception as e:
                     if self.logger:

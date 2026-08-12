@@ -182,21 +182,11 @@ class Reconciler:
                 for filename in files:
                     full_path = os.path.join(root, filename)
                     try:
-                        stat = os.stat(full_path)
-                        rel_path = os.path.relpath(full_path, watch_path)
-
-                        if self.event_store:
-                            self.event_store.upsert_file_identity(
-                                volume_id=volume,
-                                frn=0,  # 初始扫描无 FRN
-                                watch_root=watch_path,
-                                relative_path=rel_path,
-                                is_directory=False,
-                                last_usn=0,
-                                file_size=stat.st_size,
-                                mtime_ns=stat.st_mtime_ns,
-                                state="ACTIVE",
-                            )
+                        # 仅计数，不写入 file_identity：
+                        # frn=0 会导致 PRIMARY KEY(volume_id, file_reference_number)
+                        # 冲突（所有文件共享同一 PK，只保留最后一条）。
+                        # 真实 FRN 由后续 USN 事件自动填充。
+                        os.stat(full_path)
                         total_files += 1
                     except OSError:
                         continue
@@ -219,12 +209,24 @@ class Reconciler:
         全量重扫：重新扫描所有监控路径。
 
         用于 journal_id 变化或 gap recovery。
+        对比 file_identity 表，标记已删除文件，添加新发现文件。
         """
         watch_paths = self._get_watch_paths_for_volume(volume)
         if not watch_paths:
             return
 
-        # 扫描并收集当前文件列表
+        if not self.event_store:
+            self.logger.warning("无 event_store，无法执行全量重扫")
+            return
+
+        # 1. 从 file_identity 表获取当前已知文件
+        try:
+            known_identities = self.event_store.list_file_identities(volume)
+        except Exception as e:
+            self.logger.error(f"查询 file_identity 失败: {e}")
+            known_identities = {}
+
+        # 2. 扫描文件系统，收集当前文件
         current_files = set()
         for watch_path in watch_paths:
             if not os.path.exists(watch_path):
@@ -236,27 +238,116 @@ class Reconciler:
 
                 for filename in files:
                     full_path = os.path.join(root, filename)
-                    current_files.add(full_path)
+                    current_files.add(os.path.normcase(full_path))
+
+        # 3. 标记已删除文件（在 file_identity 中但不在文件系统中）
+        deleted_count = 0
+        for frn, identity in known_identities.items():
+            abs_path = os.path.normcase(
+                os.path.join(identity["watch_root"], identity["relative_path"])
+            )
+            if abs_path not in current_files and identity.get("state") == "ACTIVE":
+                try:
+                    self.event_store.update_file_identity_state(
+                        volume, frn, "DELETED"
+                    )
+                    deleted_count += 1
+                except Exception:
+                    pass
+
+        # 4. 不写入 frn=0 的新文件（与 N1 同理，会导致 PK 冲突）
+        # 新文件由后续 USN 事件自动填充到 file_identity
 
         self.logger.info(
             f"全量重扫完成: 卷 {volume}, "
-            f"{len(current_files)} 个文件"
+            f"{len(current_files)} 个文件, "
+            f"标记删除 {deleted_count}"
         )
 
     def _periodic_check(self):
         """
         周期性一致性检查。
 
-        对比 USN checkpoint 状态与文件系统实际状态，
+        对比文件系统实际状态与 file_identity 表：
+        - 文件存在但 FRN/size/mtime 变化 → 文件被替换
+        - 文件不存在但 file_identity 中为 ACTIVE → 文件被删除
         发现不一致时触发 reconciliation。
         """
         self.logger.debug("执行周期性一致性检查")
-        # 简单检查：确认监控路径仍然存在
+
+        if not self.event_store:
+            return
+
+        inconsistencies = 0
+
         for watch_path in self.config.watch_paths:
             if not os.path.exists(watch_path):
                 self.logger.warning(
                     f"监控路径不存在: {watch_path}，可能需要重新配置"
                 )
+                inconsistencies += 1
+                continue
+
+            # 获取该卷的 file_identity 记录
+            drive = os.path.splitdrive(os.path.abspath(watch_path))[0]
+            volume = drive.upper().rstrip('\\')
+
+            try:
+                known_identities = self.event_store.list_file_identities(volume)
+            except Exception as e:
+                self.logger.error(f"查询 file_identity 失败: {e}")
+                continue
+
+            # 扫描文件系统
+            for root, dirs, files in os.walk(watch_path):
+                if self._stop_event.is_set():
+                    break
+
+                for filename in files:
+                    full_path = os.path.normcase(
+                        os.path.join(root, filename)
+                    )
+                    try:
+                        stat = os.stat(full_path)
+                    except OSError:
+                        continue
+
+                    # 查找对应的 file_identity 记录
+                    for frn, identity in known_identities.items():
+                        identity_path = os.path.normcase(
+                            os.path.join(
+                                identity["watch_root"],
+                                identity["relative_path"],
+                            )
+                        )
+                        if identity_path != full_path:
+                            continue
+                        if identity.get("state") != "ACTIVE":
+                            continue
+
+                        # 比对文件大小和修改时间，检测文件被替换
+                        db_size = identity.get("file_size")
+                        db_mtime = identity.get("mtime_ns")
+                        if (db_size is not None
+                                and db_size != stat.st_size):
+                            self.logger.warning(
+                                f"文件被替换检测: {full_path} "
+                                f"(size: {db_size} → {stat.st_size})"
+                            )
+                            inconsistencies += 1
+                        elif (db_mtime is not None
+                                and db_mtime != stat.st_mtime_ns):
+                            self.logger.warning(
+                                f"文件内容变化: {full_path} "
+                                f"(mtime 不一致)"
+                            )
+                            inconsistencies += 1
+                        break
+
+        if inconsistencies > 0:
+            self.logger.warning(
+                f"周期性检查发现 {inconsistencies} 处不一致"
+            )
 
     def _get_watch_paths_for_volume(self, volume: str) -> List[str]:
         """获取指定卷对应的监控路径"""

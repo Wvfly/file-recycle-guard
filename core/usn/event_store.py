@@ -267,6 +267,30 @@ class UsnEventStore:
         columns = [desc[0] for desc in cur.description]
         return dict(zip(columns, row))
 
+    def list_file_identities(self, volume_id: str) -> Dict[int, Dict]:
+        """
+        列出指定卷的所有文件身份记录。
+
+        Returns:
+            {frn: {volume_id, file_reference_number, watch_root,
+                   relative_path, is_directory, last_usn,
+                   file_size, mtime_ns, state}, ...}
+        """
+        conn = self._get_conn()
+        cur = conn.execute(
+            "SELECT volume_id, file_reference_number, watch_root, "
+            "relative_path, is_directory, last_usn, file_size, mtime_ns, state "
+            "FROM file_identity WHERE volume_id = ?",
+            (volume_id,)
+        )
+        columns = [desc[0] for desc in cur.description]
+        result = {}
+        for row in cur.fetchall():
+            record = dict(zip(columns, row))
+            frn = record["file_reference_number"]
+            result[frn] = record
+        return result
+
     def update_file_identity_state(self, volume_id: str, frn: int,
                                     state: str):
         """更新文件身份状态（如标记为 DELETED）"""
