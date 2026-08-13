@@ -381,6 +381,24 @@ class DirectoryTreeCache:
                 result[row[0]] = row[1]
         return result
 
+    def get_dirs_with_mtime_change(self) -> List[str]:
+        """
+        获取磁盘 mtime 与缓存 mtime 不一致的目录列表（P1-3）。
+        用于增量发现新子目录：只扫描这些目录的直接子目录。
+        """
+        conn = self._get_conn()
+        cur = conn.execute("SELECT path, mtime FROM dir_tree")
+        changed = []
+        for row in cur.fetchall():
+            dir_path, cached_mtime = row
+            try:
+                actual_mtime = os.stat(dir_path).st_mtime
+                if abs(actual_mtime - cached_mtime) > 0.5:
+                    changed.append(dir_path)
+            except OSError:
+                pass
+        return changed
+
 
 # ── 内存 LRU 热缓存 ───────────────────────────────────────────
 
@@ -423,8 +441,8 @@ class MemoryLRUCache:
 # ── 路径哈希工具 ───────────────────────────────────────────────
 
 def _path_hash(path: str) -> str:
-    """计算路径的短哈希（用于缓存 key）"""
-    return hashlib.md5(os.path.normcase(path).encode("utf-8")).hexdigest()
+    """计算路径的短哈希（用于缓存 key）P2-2: MD5→SHA256截断"""
+    return hashlib.sha256(os.path.normcase(path).encode("utf-8")).hexdigest()[:16]
 
 
 # 不支持 stat 操作的错误码（SMB 网络共享上某些文件会返回）
@@ -594,22 +612,43 @@ class IncrementalScanner:
         """
         发现磁盘上存在但不在目录树缓存中的新目录。
         解决 watchdog 缓冲区溢出导致新目录创建事件丢失的问题。
+        P1-3 修复：增量扫描替代全量 os.walk()。
+        策略：(1) 扫描缓存中 mtime 变化的目录的直接子目录；
+              (2) 检查 watch_path 根目录下的新增子目录。
         """
         new_dirs = []  # [(dir_path, watch_path), ...]
         for watch_path in config.watch_paths:
             if not os.path.exists(watch_path):
                 continue
             norm_watch = os.path.normcase(os.path.abspath(watch_path))
-            base_depth = norm_watch.count(os.sep)
-            for root, dirs, files in os.walk(watch_path):
-                dirs[:] = [d for d in dirs if d not in config.exclude_dirs]
-                for d in dirs:
-                    dir_path = os.path.normcase(
-                        os.path.abspath(os.path.join(root, d))
-                    )
-                    # 检查是否已在缓存中（快速查询）
-                    if dir_cache.get_dir_mtime(dir_path) == 0.0:
-                        new_dirs.append((dir_path, norm_watch))
+
+            # 策略 1：扫描缓存中 mtime 变化的目录的直接子目录
+            changed_dirs = dir_cache.get_dirs_with_mtime_change()
+            for dir_path in changed_dirs:
+                try:
+                    entries = os.scandir(dir_path)
+                    for entry in entries:
+                        if entry.is_dir(follow_symlinks=False):
+                            child = os.path.normcase(
+                                os.path.abspath(entry.path)
+                            )
+                            if dir_cache.get_dir_mtime(child) == 0.0:
+                                new_dirs.append((child, norm_watch))
+                    entries.close()
+                except OSError:
+                    pass
+
+            # 策略 2：检查 watch_path 根目录下的新增子目录
+            try:
+                for entry in os.scandir(watch_path):
+                    if entry.is_dir(follow_symlinks=False):
+                        child = os.path.normcase(
+                            os.path.abspath(entry.path)
+                        )
+                        if dir_cache.get_dir_mtime(child) == 0.0:
+                            new_dirs.append((child, norm_watch))
+            except OSError:
+                pass
 
         if new_dirs:
             logger.info(f"发现 {len(new_dirs)} 个新目录，更新目录树缓存...")

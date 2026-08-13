@@ -19,6 +19,7 @@ import threading
 from ctypes import wintypes
 from typing import Optional, Dict, Tuple, List
 from dataclasses import dataclass, field
+from collections import OrderedDict
 
 from .record import (
     get_full_path_by_frn,
@@ -35,33 +36,35 @@ from .record import (
 # FRN -> 路径缓存（LRU）
 # ═══════════════════════════════════════════════════════════════
 
-FRN_PATH_CACHE_CAPACITY = 50_000
+FRN_PATH_CACHE_CAPACITY = 500_000  # P2-1: 50K→500K
 
 
 class FrnPathCache:
     """
     文件引用号 -> 绝对路径的内存缓存。
     用于快速解析 USN 记录中的文件路径，避免每次 OpenFileById。
-    使用固定容量 + 批量淘汰策略。
+    P2-1 修复：使用 OrderedDict 标准 LRU 淘汰。
     """
 
     def __init__(self, max_size: int = FRN_PATH_CACHE_CAPACITY):
-        self._cache: Dict[int, str] = {}
+        self._cache: OrderedDict = OrderedDict()
         self._max_size = max_size
         self._lock = threading.Lock()
 
     def get(self, frn: int) -> Optional[str]:
         with self._lock:
-            return self._cache.get(frn)
+            if frn in self._cache:
+                self._cache.move_to_end(frn)
+                return self._cache[frn]
+        return None
 
     def set(self, frn: int, path: str):
         with self._lock:
-            if len(self._cache) >= self._max_size:
-                # 淘汰一半（简单策略，非精确 LRU）
-                keys = list(self._cache.keys())[:len(self._cache) // 2]
-                for k in keys:
-                    del self._cache[k]
+            if frn in self._cache:
+                self._cache.move_to_end(frn)
             self._cache[frn] = path
+            while len(self._cache) > self._max_size:
+                self._cache.popitem(last=False)
 
     def remove(self, frn: int):
         with self._lock:
@@ -102,33 +105,34 @@ class DirectoryIdentityCache:
     线程安全：使用读写锁保护。
     """
 
-    CAPACITY = 100_000  # 最大缓存目录数
+    CAPACITY = 500_000  # P2-1: 100K→500K
 
     def __init__(self):
-        # frn -> DirIdentity
-        self._cache: Dict[int, DirIdentity] = {}
-        # (volume_id, frn) -> 快速索引
+        # frn -> DirIdentity，使用 OrderedDict 标准 LRU
+        self._cache: OrderedDict = OrderedDict()
         self._lock = threading.Lock()
 
     def get(self, frn: int) -> Optional[DirIdentity]:
         """查询目录的 FRN 身份信息"""
         with self._lock:
-            return self._cache.get(frn)
+            if frn in self._cache:
+                self._cache.move_to_end(frn)
+                return self._cache[frn]
+        return None
 
     def set(self, frn: int, parent_frn: int, name: str, volume_id: str):
         """添加/更新目录的 FRN 身份信息"""
         with self._lock:
-            if len(self._cache) >= self.CAPACITY:
-                # 淘汰一半
-                keys = list(self._cache.keys())[:len(self._cache) // 2]
-                for k in keys:
-                    del self._cache[k]
+            if frn in self._cache:
+                self._cache.move_to_end(frn)
             self._cache[frn] = DirIdentity(
                 frn=frn,
                 parent_frn=parent_frn,
                 name=name,
                 volume_id=volume_id,
             )
+            while len(self._cache) > self.CAPACITY:
+                self._cache.popitem(last=False)
 
     def update_rename(self, frn: int, new_name: str,
                       new_parent_frn: Optional[int] = None):

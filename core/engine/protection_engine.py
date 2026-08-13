@@ -51,8 +51,8 @@ class ProtectionEngine:
     # worker 线程数（默认值，实际使用时优先读取 config.usn.protection_workers）
     WORKER_COUNT = 4
 
-    # 批量处理大小
-    BATCH_SIZE = 100
+    # 批量处理大小（P1-4: 100→500）
+    BATCH_SIZE = 500
 
     def __init__(self, config, logger, event_store=None):
         """

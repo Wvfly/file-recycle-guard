@@ -105,9 +105,18 @@ def create_app(config: Config, logger) -> FastAPI:
 
     @app.middleware("http")
     async def access_log_middleware(request: Request, call_next):
-        """记录每个 HTTP 请求到 access.log"""
+        """记录每个 HTTP 请求到 access.log，请求结束后归还 DB 连接到池"""
         start = time.time()
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        finally:
+            # 归还当前线程的 DB 连接到池，避免连接池耗尽
+            db = get_db()
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
         duration_ms = (time.time() - start) * 1000
         client = request.client.host if request.client else "-"
         access_logger.info(

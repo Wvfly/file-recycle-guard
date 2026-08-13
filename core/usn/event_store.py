@@ -293,7 +293,7 @@ class UsnEventStore:
 
     def update_file_identity_state(self, volume_id: str, frn: int,
                                     state: str):
-        """更新文件身份状态（如标记为 DELETED）"""
+        """更新单个文件身份状态（如标记为 DELETED）"""
         conn = self._get_conn()
         with self._lock:
             conn.execute(
@@ -302,6 +302,81 @@ class UsnEventStore:
                 (state, volume_id, frn)
             )
             conn.commit()
+
+    def batch_upsert_file_identities(self, items: List[Tuple]):
+        """
+        批量 upsert file_identity（P0-2b）。
+        items: [(volume_id, frn, watch_root, rel_path, is_dir, last_usn,
+                 file_size, mtime_ns, state), ...]
+        """
+        if not items:
+            return
+        conn = self._get_conn()
+        with self._lock:
+            conn.executemany(
+                "INSERT INTO file_identity "
+                "(volume_id, file_reference_number, watch_root, relative_path, "
+                "is_directory, last_usn, file_size, mtime_ns, state) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(volume_id, file_reference_number) DO UPDATE SET "
+                "watch_root = excluded.watch_root, "
+                "relative_path = excluded.relative_path, "
+                "is_directory = excluded.is_directory, "
+                "last_usn = excluded.last_usn, "
+                "file_size = excluded.file_size, "
+                "mtime_ns = excluded.mtime_ns, "
+                "state = excluded.state",
+                items
+            )
+            conn.commit()
+
+    def batch_update_file_identity_states(self, volume_id: str,
+                                           frns: List[int], state: str):
+        """
+        批量更新文件身份状态（P0-3）。
+        分批执行，每批 500 条，避免 IN 子句过长。
+        """
+        if not frns:
+            return
+        conn = self._get_conn()
+        with self._lock:
+            batch_size = 500
+            for i in range(0, len(frns), batch_size):
+                batch = frns[i:i + batch_size]
+                placeholders = ",".join("?" for _ in batch)
+                conn.execute(
+                    f"UPDATE file_identity SET state = ? "
+                    f"WHERE volume_id = ? AND file_reference_number IN ({placeholders})",
+                    [state, volume_id] + batch
+                )
+            conn.commit()
+
+    def iter_file_identities(self, volume_id: str,
+                              page_size: int = 10000):
+        """
+        分页迭代 file_identity 记录（P1-2），避免亿级数据 OOM。
+        每次 yield 一个 {frn: record} 字典。
+        """
+        conn = self._get_conn()
+        offset = 0
+        while True:
+            cur = conn.execute(
+                "SELECT volume_id, file_reference_number, watch_root, "
+                "relative_path, is_directory, last_usn, file_size, mtime_ns, state "
+                "FROM file_identity WHERE volume_id = ? "
+                "ORDER BY file_reference_number LIMIT ? OFFSET ?",
+                (volume_id, page_size, offset)
+            )
+            rows = cur.fetchall()
+            if not rows:
+                break
+            columns = [desc[0] for desc in cur.description]
+            page = {}
+            for row in rows:
+                record = dict(zip(columns, row))
+                page[record["file_reference_number"]] = record
+            yield page
+            offset += page_size
 
     # ── 生命周期 ──────────────────────────────────────────────
 

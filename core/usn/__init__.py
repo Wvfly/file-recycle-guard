@@ -23,6 +23,7 @@ import threading
 import time
 from typing import List, Dict, Callable, Optional, Tuple
 from dataclasses import dataclass, field
+from collections import OrderedDict
 
 # 子模块导出
 from .record import (
@@ -109,8 +110,9 @@ class UsnJournalMonitor:
         # 排除规则（在 create_usn_watcher 中设置）
         self._exclude_patterns: List[str] = []
         self._exclude_dirs: List[str] = []
-        # 去重跟踪
-        self._recent_events: Dict[Tuple[str, str], Tuple[float, int]] = {}
+        # 去重跟踪（P2-3: OrderedDict 标准 LRU + 阈值触发清理）
+        self._recent_events: OrderedDict = OrderedDict()
+        self._dedup_cleanup_threshold = 10_000
         self.logger = None
 
         # 统计
@@ -214,17 +216,18 @@ class UsnJournalMonitor:
         return False
 
     def _is_duplicate(self, full_path: str, reason: str) -> bool:
-        """检查事件是否为短期内重复事件"""
+        """检查事件是否为短期内重复事件（P2-3: 阈值触发清理）"""
         key = (os.path.normcase(full_path), reason)
         now = time.time()
 
-        # 清理过期的去重记录
-        expired = [
-            k for k, (t, _) in self._recent_events.items()
-            if now - t > self.DEDUP_WINDOW_SEC * 2
-        ]
-        for k in expired:
-            del self._recent_events[k]
+        # 超过阈值时从头部淘汰过期记录
+        if len(self._recent_events) > self._dedup_cleanup_threshold:
+            expired_keys = [
+                k for k, (t, _) in self._recent_events.items()
+                if now - t > self.DEDUP_WINDOW_SEC * 2
+            ]
+            for k in expired_keys:
+                del self._recent_events[k]
 
         if key in self._recent_events:
             t, _ = self._recent_events[key]
@@ -234,8 +237,10 @@ class UsnJournalMonitor:
         return False
 
     def _mark_seen(self, full_path: str, reason: str, usn: int):
-        """标记事件已处理"""
+        """标记事件已处理（P2-3: move_to_end 保持 LRU 顺序）"""
         key = (os.path.normcase(full_path), reason)
+        if key in self._recent_events:
+            self._recent_events.move_to_end(key)
         self._recent_events[key] = (time.time(), usn)
 
     def set_exclude_rules(self, patterns: List[str], dirs: List[str]):
