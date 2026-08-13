@@ -8,10 +8,16 @@
     python test/run_all_tests.py --quick      # 快速模式（仅单元测试，不依赖外部服务）
     python test/run_all_tests.py --module config  # 仅运行指定模块测试
 """
+import io
 import os
 import sys
 import time
 import unittest
+
+# GitHub Actions Windows runner 默认代码页不是 UTF-8，强制 stdout/stderr 使用 UTF-8
+# 避免中文输出报 UnicodeEncodeError
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 # 确保项目根目录在 sys.path 中
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
