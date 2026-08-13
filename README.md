@@ -30,8 +30,9 @@
 
 | 功能 | 说明 |
 |------|------|
-| 📡 **实时监控** | 基于 watchdog 监控文件变更（创建/修改/删除/移动） |
-| 🔄 **增量分片同步** | IncrementalScanner 主动扫描，SQLite 持久化缓存 + 三层缓存架构，支持亿级文件 |
+| 💽 **USN Journal 检测** | 基于 NTFS USN Journal 内核级零遗漏检测，SQLite checkpoint 断线追补，gap/reset 自动一致性修复 |
+| 📡 **实时监控** | watchdog 低延迟加速器，USN 不可用时自动回退为主通道 |
+| 🔄 **增量分片同步** | IncrementalScanner 主动扫描兜底，SQLite 持久化缓存 + 三层缓存架构，支持亿级文件 |
 | 💾 **备份镜像** | 实时同步文件到备份目录，per-file 锁池并行备份，SHA256 去重 |
 | 🗑️ **回收站** | 被删除文件自动移入回收站，支持按保留天数自动清理 |
 | 🔁 **一键恢复** | Web 界面浏览、搜索、恢复已删除文件，后端分页查询 |
@@ -65,15 +66,20 @@
 ╚══════════════════════════╦═══════════════════════════╦═══════════════════════╝
                            ║                           ║
               ┌────────────╨────────────┐  ┌───────────╨───────────┐
-              │  🅰 通道 A ─ 实时检测    │  │  🅱 通道 B ─ 增量分片扫描  │
+              │  🅰 通道 A ─ 实时检测    │  │  🅱 通道 B ─ 兜底扫描  │
               │                         │  │                       │
-              │  📡 watchdog Observer   │  │  🔄 IncrementalScanner │
+              │  💽 USN Journal 主通道   │  │  🔄 IncrementalScanner│
               │  ─────────────────────  │  │  ────────────────────  │
-              │  on_created   → 备份    │  │  ✦ SQLite 持久化缓存   │
-              │  on_modified  → 备份    │  │  ✦ 目录树 mtime 分层   │
-              │  on_deleted   → 延迟确认 │  │  ✦ 内存 LRU 热缓存    │
-              │  on_moved     → 备份+回收│  │  ✦ 异步备份线程池     │
-              │                         │  │  ✦ 时间预算分片扫描    │
+              │  ✦ NTFS 内核级记录      │  │  ✦ SQLite 持久化缓存   │
+              │  ✦ 零事件遗漏           │  │  ✦ 目录树 mtime 分层   │
+              │  ✦ checkpoint 断线追补  │  │  ✦ 内存 LRU 热缓存     │
+              │  ✦ gap/reset 自动修复   │  │  ✦ 异步备份线程池      │
+              │  📡 watchdog 低延迟加速 │  │  ✦ 时间预算分片扫描    │
+              │  on_created   → 备份    │  │                       │
+              │  on_modified  → 备份    │  │                       │
+              │  on_deleted   → 延迟确认 │  │                       │
+              │  on_moved     → 备份+回收│  │                       │
+              │                         │  │                       │
               └────────────┬────────────┘  └───────────┬───────────┘
                            │                           │
                            └─────────┬─────────────────┘
@@ -222,6 +228,39 @@
   └──────────────┘
 ```
 
+### USN 变更检测流水线
+
+USN Journal 模式下，事件经过「读取 → 标准化 → 合并 → 执行」四层处理，并通过 SQLite 持久化队列保证不丢事件：
+
+```
+USN Journal (NTFS 内核)          watchdog (低延迟加速器)
+        │                                │
+        ▼                                ▼
+   UsnJournalReader               on_created / on_modified
+   (轮询 + checkpoint)            on_deleted / on_moved
+        │                                │
+        └──────────────┬─────────────────┘
+                       ▼
+   ┌───────────────────────────────────────────────┐
+   │  EventNormalizer ── 标准化为统一事件格式        │
+   │  EventCoalescer  ── 合并同文件重复事件          │
+   │  ProtectionEngine ── 消费事件并执行操作         │
+   │    ├── CREATE / MODIFY ──→ backup_file()       │
+   │    ├── DELETE          ──→ move_to_recycle()   │
+   │    └── RENAME          ──→ 更新备份路径         │
+   └───────────────────────────────────────────────┘
+                       │
+                       ▼
+        SQLite fs_event（durable queue）
+        checkpoint 仅在事件持久化后推进
+        （崩溃恢复：PROCESSING → PENDING 重放）
+
+   Reconciler ── 一致性修复器
+     ├── 首次启动全量扫描（build full snapshot）
+     ├── journal gap / reset ──→ 触发增量重扫
+     └── 周期性一致性检查（修正遗漏事件）
+```
+
 ### 线程模型
 
 ```
@@ -239,23 +278,36 @@
 ║  └─────────────────────────┘   └──────────────────────────────────────┘   ║
 ║                                                                            ║
 ║  ┌─────────────────────────┐   ┌──────────────────────────────────────┐   ║
-║  │ 🧵 watchdog Observer    │   │ 🧵 SyncThread (IncrementalScanner)    │   ║
+║  │ 🧵 UsnMonitor           │   │ 🧵 ProtectionEngine Workers          │   ║
 ║  │ ─────────────────────── │   │ ──────────────────────────────────── │   ║
-║  │ ✦ 监听文件系统事件       │   │ ✦ 游标分页遍历目录树 (SQLite)        │   ║
-║  │ ✦ 事件去重 (deque 500)  │   │ ✦ 三层缓存: 内存LRU→SQLite→os.stat  │   ║
-║  │ ✦ created/modified      │   │ ✦ 目录 mtime 层次化跳过              │   ║
-║  │   → backup_file()       │   │ ✦ 异步备份线程池 (8 workers)         │   ║
-║  │ ✦ deleted → 延迟队列    │   │ ✦ 时间预算分片 + 后台目录树重建      │   ║
+║  │ ✦ 轮询 NTFS USN Journal │   │ ✦ 消费合并后的标准化事件 (4 workers) │   ║
+║  │ ✦ 事件标准化 + 去重合并 │   │ ✦ CREATE / MODIFY → 备份            │   ║
+║  │ ✦ checkpoint 断线追补   │   │ ✦ DELETE → 移入回收站               │   ║
+║  │ ✦ gap/reset → 触发修复  │   │ ✦ RENAME → 更新备份路径             │   ║
+║  │ ✦ fs_event 持久化队列   │   │ ✦ 操作完成 → 推进 checkpoint         │   ║
 ║  └─────────────────────────┘   └──────────────────────────────────────┘   ║
 ║                                                                            ║
 ║  ┌─────────────────────────┐   ┌──────────────────────────────────────┐   ║
-║  │ 🧵 CleanupThread        │   │ 🧵 Web (Uvicorn)                     │   ║
+║  │ 🧵 Reconciler           │   │ 🧵 watchdog Observer (加速器)         │   ║
 ║  │ ─────────────────────── │   │ ──────────────────────────────────── │   ║
-║  │ ✦ 每 3600s 执行         │   │ ✦ FastAPI + Jinja2 暗色主题          │   ║
-║  │ ✦ 过期回收站清理         │   │ ✦ HTTP Basic Auth 认证               │   ║
-║  │ ✦ 孤立备份文件回收       │   │ ✦ REST API (JSON)                    │   ║
-║  │ ✦ 宽限期保护机制         │   │ ✦ 浏览 / 搜索 / 恢复 / 清空          │   ║
+║  │ ✦ 首次启动全量扫描      │   │ ✦ USN 不可用时回退为主通道           │   ║
+║  │ ✦ journal gap 恢复      │   │ ✦ 事件去重 (deque 500)               │   ║
+║  │ ✦ 周期性一致性检查      │   │ ✦ created/modified → backup_file()   │   ║
+║  │                         │   │ ✦ deleted → 延迟队列 (2s 确认)        │   ║
 ║  └─────────────────────────┘   └──────────────────────────────────────┘   ║
+║                                                                            ║
+║  ┌─────────────────────────┐   ┌──────────────────────────────────────┐   ║
+║  │ 🧵 SyncThread (增量扫描)│   │ 🧵 CleanupThread                     │   ║
+║  │ ─────────────────────── │   │ ──────────────────────────────────── │   ║
+║  │ ✦ 游标分页遍历目录树    │   │ ✦ 每 3600s 执行                      │   ║
+║  │ ✦ 三层缓存: LRU→SQLite  │   │ ✦ 过期回收站清理                     │   ║
+║  │ ✦ 目录 mtime 层次化跳过 │   │ ✦ 孤立备份文件回收                   │   ║
+║  │ ✦ 异步备份线程池 (8)    │   │ ✦ 宽限期保护机制                     │   ║
+║  │ ✦ 时间预算分片扫描      │   │                                       │   ║
+║  └─────────────────────────┘   └──────────────────────────────────────┘   ║
+║                                                                            ║
+║  📡 Web (Uvicorn) 线程 ── FastAPI + Jinja2 暗色主题 · HTTP Basic Auth     ║
+║     ✦ REST API (JSON) · 后端分页 · 统计缓存 60s · 浏览/搜索/恢复/清空     ║
 ║                                                                            ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  🔒 并发安全机制                                                            ║
@@ -321,7 +373,9 @@
 | 决策 | 方案 | 原因 |
 |------|------|------|
 | **删除确认机制** | 延迟 2 秒确认 | Office 等程序保存文件时会先删后建，避免误判为删除 |
-| **双通道检测** | watchdog + 增量分片扫描 | watchdog 在 SMB 场景下不可靠，IncrementalScanner 弥补遗漏 |
+| **三通道检测** | USN Journal + watchdog + 增量分片扫描 | USN 内核级零遗漏（主通道），watchdog 低延迟加速，增量扫描兜底一致性 |
+| **USN checkpoint** | SQLite 持久化 + 事件先落库再推进 | 崩溃后可断线追补，fs_event 持久化队列保证事件不丢失 |
+| **事件流水线** | Normalizer → Coalescer → ProtectionEngine | 多来源事件统一标准化，同文件重复事件合并后再执行，避免重复备份 |
 | **per-file 锁池** | 4096 个锁 + 路径哈希选槽 | 替代全局锁，允许多文件并行备份，大幅提升 SMB 吞吐 |
 | **三层缓存架构** | 内存 LRU → SQLite → os.stat | SQLite 持久化避免亿级文件 OOM，内存 LRU 加速高频访问 |
 | **目录树分层扫描** | 目录 mtime + 游标分页 | 未变化的整个子树跳过，避免无效 stat 调用 |
@@ -342,6 +396,7 @@
 | 操作系统 | Windows 10/11 或 Windows Server |
 | Python | 3.10+（仅开发/构建时需要） |
 | MySQL | 5.7+ / 8.0+ |
+| 权限 | 管理员权限（USN Journal 模式必需，读取 NTFS 变更日志） |
 
 ### 安装步骤
 
@@ -376,6 +431,15 @@ recycle_dir: "E:\\share_ryc"
 # 回收站保留天数（超过自动清理）
 retention_days: 30
 
+# USN Journal 检测（推荐，需管理员权限运行）
+usn:
+  enabled: true            # 启用后 USN 为主通道，watchdog 为加速器
+  poll_interval: 1.0       # USN 轮询间隔（秒）
+  state_dir: ".usn_state"  # checkpoint 状态存储目录
+  max_records_per_read: 10000  # 单次轮询最大读取记录数
+  buffer_size_mb: 4        # USN 读取缓冲区大小（MB），高并发建议 4-8
+  protection_workers: 4    # 保护引擎 worker 线程数
+
 # Web 管理界面（强烈建议设置密码）
 web:
   enabled: true
@@ -396,16 +460,18 @@ database:
 
 ```bash
 # 方式一：使用启动脚本（推荐，自动检查依赖）
-start.bat
-
+#   普通模式：      start.bat
+#   USN 模式：      start_admin.bat / start_admin.ps1（自动提权管理员运行）
 # 方式二：直接运行
-python main.py start       # 启动守护程序
+python main.py start       # 启动守护程序（USN 模式需在管理员终端执行）
 python main.py stop        # 停止守护程序
 python main.py status      # 查看运行状态
 python main.py web         # 仅启动 Web 界面（不监控）
 ```
 
 启动后访问 `http://localhost:8088` 即可打开 Web 管理界面。
+
+> **提示：** 启用 USN Journal 检测（`usn.enabled: true`）时必须**以管理员身份**运行程序，否则 USN 初始化失败会自动回退到 watchdog 模式（可运行 `start_admin.bat` 一键提权启动）。
 
 ## 📦 打包部署
 
@@ -442,13 +508,28 @@ build.bat
 file-recycle-guard/
 ├── core/                       # 核心模块
 │   ├── config.py               # 配置加载与路径解析
-│   ├── watcher.py              # 文件监控（watchdog）
+│   ├── watcher.py              # 文件监控（watchdog 加速器）
 │   ├── backup.py               # 备份逻辑（per-file锁池 + 竞态校验 + 攒批写入）
-│   ├── recycler.py             # 回收站管理（列表/恢复/清空）
+│   ├── recycler.py             # 回收站管理（列表/恢复/清空/数据库对账）
 │   ├── cleanup.py              # 备份镜像定期清理
 │   ├── sync.py                 # 增量分片同步（SQLite缓存 + 目录树分层 + 异步备份）
 │   ├── logger.py               # 日志模块（按天轮转）
-│   └── database.py             # MySQL 数据库（连接池 + 路径哈希 + 批量upsert）
+│   ├── database.py             # MySQL 数据库（连接池 + 路径哈希 + 批量upsert）
+│   ├── usn/                    # USN Journal 模块
+│   │   ├── record.py           # USN 记录结构体 / 卷句柄 / 路径解析
+│   │   ├── reader.py           # UsnJournalReader 读取器 + 事件模型
+│   │   ├── journal.py          # Journal 信息查询 / 健康度计算
+│   │   ├── checkpoint.py       # SQLite checkpoint 存储（断线追补）
+│   │   ├── path_resolver.py    # FRN 路径缓存（快路径映射）
+│   │   ├── event_store.py      # fs_event 持久化队列（SQLite）
+│   │   └── __init__.py         # UsnJournalMonitor 多卷监控器
+│   ├── detector/               # 变更检测层
+│   │   ├── usn_detector.py     # UsnDetector（整合监控/标准化/合并/执行）
+│   │   └── reconciler.py       # Reconciler 一致性修复器（全量扫描/gap恢复）
+│   └── engine/                 # 事件处理引擎
+│       ├── event_normalizer.py # 多来源事件统一标准化
+│       ├── event_coalescer.py  # 同文件重复事件合并
+│       └── protection_engine.py# 消费事件执行备份/删除/重命名
 ├── web/                        # Web 管理界面
 │   ├── __init__.py             # FastAPI 应用（路由/认证/分页API）
 │   └── templates/
@@ -458,6 +539,7 @@ file-recycle-guard/
 ├── config.yaml                 # 配置文件
 ├── requirements.txt            # Python 依赖
 ├── start.bat                   # 快速启动脚本
+├── start_admin.bat             # 管理员提权启动脚本（USN 模式）
 ├── build.bat                   # Nuitka 打包脚本
 └── _build_nuitka.py            # Nuitka 打包脚本（Python 版）
 ```
@@ -488,6 +570,14 @@ file-recycle-guard/
 | `mirror_cleanup.grace_period` | 清理宽限期（秒） | `300` |
 | `sync.enabled` | 是否启用定期同步 | `true` |
 | `sync.interval` | 同步扫描间隔（秒） | `30` |
+| `sync.cache_dir` | 同步缓存目录（留空自动推导为备份目录父目录） | `自动推导` |
+| `sync.backup_workers` | 增量同步 + 初始全量备份线程数 | `8` |
+| `usn.enabled` | 是否启用 USN Journal 检测（需管理员权限） | `false` |
+| `usn.poll_interval` | USN 轮询间隔（秒） | `1.0` |
+| `usn.state_dir` | checkpoint 状态存储目录 | `.usn_state` |
+| `usn.max_records_per_read` | 单次轮询最大读取记录数 | `10000` |
+| `usn.buffer_size_mb` | USN 读取缓冲区大小（MB） | `4` |
+| `usn.protection_workers` | 保护引擎 worker 线程数 | `4` |
 | `database.host` | MySQL 主机 | `127.0.0.1` |
 | `database.port` | MySQL 端口 | `3306` |
 | `database.user` | MySQL 用户名 | `root` |
@@ -499,9 +589,21 @@ file-recycle-guard/
 ## ❓ 常见问题
 
 <details>
+<summary><b>Q: USN Journal 检测需要管理员权限吗？</b></summary>
+
+<p>需要。读取 NTFS USN Journal 需要管理员权限，请使用 <code>start_admin.bat</code> 或右键「以管理员身份运行」。若权限不足，程序会自动回退到 watchdog 模式并记录日志，核心功能不受影响。</p>
+</details>
+
+<details>
+<summary><b>Q: USN Journal、watchdog、增量扫描是什么关系？</b></summary>
+
+<p>三者构成三通道检测：<b>USN Journal</b> 由 NTFS 内核维护变更日志，零事件遗漏，是主通道；<b>watchdog</b> 提供低延迟响应，是加速器；<b>IncrementalScanner</b> 主动扫描目录树，是最终一致性兜底。USN 不可用时自动回退 watchdog 模式。</p>
+</details>
+
+<details>
 <summary><b>Q: watchdog 能检测到 SMB 网络共享的文件变更吗？</b></summary>
 
-<p>watchdog 在 SMB 场景下存在检测不可靠的问题（某些客户端的删除操作不会触发通知）。因此程序内置了 <b>增量分片同步模块</b>（IncrementalScanner），通过 SQLite 持久化缓存 + 三层缓存架构主动扫描目录，弥补 watchdog 的遗漏。两者配合使用，确保变更不会漏检。</p>
+<p>watchdog 在 SMB 场景下存在检测不可靠的问题（某些客户端的删除操作不会触发通知）。因此程序内置了 <b>增量分片同步模块</b>（IncrementalScanner），通过 SQLite 持久化缓存 + 三层缓存架构主动扫描目录，弥补 watchdog 的遗漏。三者配合使用，确保变更不会漏检。</p>
 </details>
 
 <details>
@@ -546,7 +648,7 @@ python service.py remove
 
 | 组件 | 技术 |
 |------|------|
-| 文件监控 | [watchdog](https://github.com/gorakhargosh/watchdog) |
+| 文件监控 | USN Journal（NTFS 内核 API）+ [watchdog](https://github.com/gorakhargosh/watchdog) |
 | Web 框架 | [FastAPI](https://fastapi.tiangolo.com/) + [Uvicorn](https://www.uvicorn.org/) |
 | 模板引擎 | [Jinja2](https://jinja.palletsprojects.com/) |
 | 数据库 | [PyMySQL](https://github.com/PyMySQL/PyMySQL) + MySQL |

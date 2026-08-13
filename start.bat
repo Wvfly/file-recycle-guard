@@ -1,49 +1,48 @@
 @echo off
 python _fix_crlf.py "%~f0" 2>nul
-chcp 65001 >nul
-title æ–‡ä»¶å›žæ”¶ç«™å®ˆæŠ¤ç¨‹åº
+title ÎÄ¼þ»ØÊÕÕ¾ÊØ»¤³ÌÐò
 
 echo.
 echo ============================================
-echo   æ–‡ä»¶å›žæ”¶ç«™å®ˆæŠ¤ç¨‹åº v1.0
+echo   ÎÄ¼þ»ØÊÕÕ¾ÊØ»¤³ÌÐò v1.0
 echo   File Recycle Guard
 echo ============================================
 echo.
 
-:: åˆ‡æ¢åˆ°è„šæœ¬æ‰€åœ¨ç›®å½•
+:: ÇÐ»»µ½½Å±¾ËùÔÚÄ¿Â¼
 cd /d "%~dp0"
 
-:: æ£€æŸ¥ Python
+:: ¼ì²é Python
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [é”™è¯¯] æœªæ‰¾åˆ° Pythonï¼Œè¯·ç¡®ä¿ Python å·²å®‰è£…å¹¶æ·»åŠ åˆ° PATH
+    echo [´íÎó] Î´ÕÒµ½ Python£¬ÇëÈ·±£ Python ÒÑ°²×°²¢Ìí¼Óµ½ PATH
     pause
     exit /b 1
 )
 
-:: å®‰è£…ä¾èµ–
-echo [1/3] æ£€æŸ¥ä¾èµ–...
+:: °²×°ÒÀÀµ
+echo [1/3] ¼ì²éÒÀÀµ...
 pip install -r requirements.txt -q
 if %errorlevel% neq 0 (
-    echo [é”™è¯¯] ä¾èµ–å®‰è£…å¤±è´¥
+    echo [´íÎó] ÒÀÀµ°²×°Ê§°Ü
     pause
     exit /b 1
 )
-echo       ä¾èµ–æ£€æŸ¥å®Œæˆ
+echo       ÒÀÀµ¼ì²éÍê³É
 
-:: åˆ›å»ºå¿…è¦çš„ç›®å½•
-echo [2/3] åˆ›å»ºç›®å½•...
+:: ´´½¨±ØÒªµÄÄ¿Â¼
+echo [2/3] ´´½¨Ä¿Â¼...
 if not exist "logs" mkdir logs
-echo       ç›®å½•æ£€æŸ¥å®Œæˆ
+echo       Ä¿Â¼¼ì²éÍê³É
 
-:: å¯åŠ¨æœåŠ¡
-echo [3/3] å¯åŠ¨å®ˆæŠ¤ç¨‹åº...
-echo       ç›‘æŽ§è·¯å¾„: è¯·åœ¨ config.yaml ä¸­é…ç½® watch_paths
-echo       å¤‡ä»½ç›®å½•: è¯·åœ¨ config.yaml ä¸­é…ç½® backup_dir
-echo       å›žæ”¶ç«™ç›®å½•: è¯·åœ¨ config.yaml ä¸­é…ç½® recycle_dir
-echo       Webç®¡ç†ç•Œé¢: è¯·åœ¨ config.yaml ä¸­é…ç½® web.port
+:: Æô¶¯·þÎñ
+echo [3/3] Æô¶¯ÊØ»¤³ÌÐò...
+echo       ¼à¿ØÂ·¾¶: ÇëÔÚ config.yaml ÖÐÅäÖÃ watch_paths
+echo       ±¸·ÝÄ¿Â¼: ÇëÔÚ config.yaml ÖÐÅäÖÃ backup_dir
+echo       »ØÊÕÕ¾Ä¿Â¼: ÇëÔÚ config.yaml ÖÐÅäÖÃ recycle_dir
+echo       Web¹ÜÀí½çÃæ: ÇëÔÚ config.yaml ÖÐÅäÖÃ web.port
 echo.
-echo       æŒ‰ Ctrl+C åœæ­¢æœåŠ¡
+echo       °´ Ctrl+C Í£Ö¹·þÎñ
 echo ============================================
 echo.
 
