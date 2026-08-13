@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']          # 打 v1.0.0 等 tag 时触发发布
+  workflow_dispatch:
+    inputs:
+      deploy:
+        type: boolean
+        description: 构建后通过 SSH 部署到远程服务器（需配置 DEPLOY_* secrets）
+        default: false
+
+permissions:
+  contents: write         # 允许创建 GitHub Release
+
+jobs:
+  # ============ 1. 构建 ============
+  build:
+    name: Nuitka 打包 (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 安装依赖及 Nuitka
+        run: |
+          pip install -r requirements.txt
+          pip install nuitka
+
+      - name: 缓存 Nuitka 编译缓存
+        uses: actions/cache@v4
+        with:
+          path: .nuitka-cache
+          key: nuitka-${{ runner.os }}-${{ hashFiles('main.py', 'core/**', 'web/**') }}
+          restore-keys: |
+            nuitka-${{ runner.os }}-
+
+      - name: 构建 onefile 可执行文件
+        run: python _build_nuitka.py
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: file-recycle-guard-dist
+          path: dist/
+          if-no-files-found: error
+
+  # ============ 2. 发布 GitHub Release ============
+  # 说明：zip 只含 main.exe，不含 config.yaml。
+  # config.yaml 可能包含数据库密码等敏感信息，请勿随 Release 公开发布，
+  # 部署时按 README 中的示例自行创建。
+  release:
+    name: 发布 GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: file-recycle-guard-dist
+          path: dist
+
+      - name: 生成版本号
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: 打包 zip（仅 main.exe）
+        shell: bash
+        run: |
+          mkdir -p package
+          cp dist/main.exe package/
+          (cd package && zip -r "../file-recycle-guard-${{ steps.version.outputs.version }}.zip" main.exe)
+
+      - name: 创建 Release 并上传资产
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/main.exe
+            file-recycle-guard-${{ steps.version.outputs.version }}.zip
+          generate_release_notes: true
+
+  # ============ 3. （可选）SSH 部署到远程服务器 ============
+  # 启用方式：
+  #   1. 在仓库 Settings -> Secrets and variables -> Actions 配置：
+  #      DEPLOY_HOST（IP/域名）、DEPLOY_USER（用户名）、DEPLOY_SSH_KEY（私钥）、
+  #      DEPLOY_PORT（默认 22）、DEPLOY_PATH（目标目录，如 /d/myapp/smb_rcy）
+  #   2. 手动运行本工作流并勾选 deploy，或去掉下方 if 条件让 tag 发布时自动部署
+  deploy:
+    name: SSH 部署到远程服务器
+    needs: build
+    if: ${{ inputs.deploy == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: file-recycle-guard-dist
+          path: dist
+
+      - name: SSH 传输 main.exe 与 config.yaml
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          source: "dist/main.exe,dist/config.yaml"
+          target: ${{ secrets.DEPLOY_PATH }}
+
+      - name: 重启服务（按需调整命令）
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          script: |
+            cd ${{ secrets.DEPLOY_PATH }}
+            taskkill /f /im main.exe 2>nul || exit /b 0
+            start "" /b main.exe start

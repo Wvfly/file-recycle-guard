@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, dev]
+  pull_request:
+    branches: [main, master, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============ 1. 单元测试 ============
+  test:
+    name: 单元测试 (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 运行单元测试（快速模式，跳过外部服务依赖）
+        run: python test/run_all_tests.py --quick
+
+  # ============ 2. Nuitka 打包 ============
+  build:
+    name: Nuitka 打包 (Windows)
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 安装依赖及 Nuitka
+        # 如需固定版本可改为 pip install nuitka==2.x.x
+        run: |
+          pip install -r requirements.txt
+          pip install nuitka
+
+      - name: 缓存 Nuitka 编译缓存
+        uses: actions/cache@v4
+        with:
+          path: .nuitka-cache
+          key: nuitka-${{ runner.os }}-${{ hashFiles('main.py', 'core/**', 'web/**') }}
+          restore-keys: |
+            nuitka-${{ runner.os }}-
+
+      - name: 构建 onefile 可执行文件
+        # 依赖 GitHub-hosted runner 自带的 MSVC 工具链（VS Build Tools）
+        run: python _build_nuitka.py
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: file-recycle-guard-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

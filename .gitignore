@@ -1,7 +1,25 @@
-/.idea/.gitignore
-/.idea/file-recycle-guard.iml
-/.idea/misc.xml
-/.idea/modules.xml
-/.idea/inspectionProfiles/profiles_settings.xml
-/.idea/inspectionProfiles/Project_Default.xml
-/.idea/vcs.xml
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# === 构建产物 ===
+dist/
+main.build/
+main.dist/
+output/
+.nuitka-cache/
+nuitka-crash-report.xml
+
+# === 运行状态 ===
+logs/
+.usn_state/
+*.pid
+recycle_guard.pid
+
+# === IDE ===
+/.idea/
+.vscode/
