@@ -33,7 +33,8 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core.config import Config, load_config
-from core.database import init_database, get_db, _db_instance, Database
+import core.database as _db_module
+from core.database import init_database, get_db, Database
 from core.backup import (
     backup_file, backup_full_tree, _should_exclude,
     _compute_file_hash, _flush_meta_buffer, _meta_buffer
@@ -53,6 +54,33 @@ from core.sync import (
     _dir_has_changes, PersistentFileCache, MemoryLRUCache,
     DirectoryTreeCache
 )
+
+# ── 测试数据库配置（与生产库隔离） ─────────────────────────────
+TEST_DB_HOST = "127.0.0.1"
+TEST_DB_PORT = 3306
+TEST_DB_USER = "root"
+TEST_DB_PASSWORD = "123456"
+TEST_DB_NAME = "file_recycle_guard_test"
+
+
+def _ensure_test_db():
+    """确保测试数据库存在（幂等），返回连接参数"""
+    import pymysql
+    conn = pymysql.connect(
+        host=TEST_DB_HOST, port=TEST_DB_PORT,
+        user=TEST_DB_USER, password=TEST_DB_PASSWORD,
+        charset="utf8mb4", autocommit=True, connect_timeout=5,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE DATABASE IF NOT EXISTS `%s` "
+                "DEFAULT CHARACTER SET utf8mb4" % TEST_DB_NAME
+            )
+    finally:
+        conn.close()
+    return TEST_DB_HOST, TEST_DB_PORT, TEST_DB_USER, TEST_DB_PASSWORD, TEST_DB_NAME
+
 
 # ── 测试配置 ──────────────────────────────────────────────────
 
@@ -609,21 +637,29 @@ class TestCleanupModule(unittest.TestCase):
 
 
 class TestDatabase(unittest.TestCase):
-    """数据库操作测试（需要 MySQL）"""
+    """数据库操作测试（需要 MySQL，使用独立测试库避免污染生产数据）"""
 
     @classmethod
     def setUpClass(cls):
-        """初始化数据库连接"""
+        """初始化数据库连接（使用测试库 file_recycle_guard_test）"""
+        # 保存原始全局实例，tearDownClass 时恢复
+        cls._original_db_instance = _db_module._db_instance
         try:
+            host, port, user, pwd, dbname = _ensure_test_db()
             cls.db = init_database(
-                host="127.0.0.1", port=3306,
-                user="root", password="123456",
-                database="file_recycle_guard"
+                host=host, port=port,
+                user=user, password=pwd,
+                database=dbname,
             )
             cls.db_available = True
         except Exception as e:
-            _logger.warning(f"MySQL 不可，跳过数据库测试: {e}")
+            _logger.warning(f"MySQL 不可用，跳过数据库测试: {e}")
             cls.db_available = False
+
+    @classmethod
+    def tearDownClass(cls):
+        """重置全局数据库实例，避免影响后续测试/服务"""
+        _db_module._db_instance = cls._original_db_instance
 
     def setUp(self):
         if not self.db_available:
@@ -731,8 +767,10 @@ class TestDatabase(unittest.TestCase):
     def test_delete_expired_recycle_meta(self):
         """分批删除过期回收站元信息"""
         old_time = time.time() - 100000
+        recent_time = time.time()
+        # 插入 1 条过期记录 + 1 条未过期记录
         self.db.insert_recycle_meta(
-            recycle_path="expired_test/file.txt",
+            recycle_path="expired_test/old_file.txt",
             original_path="/src/file.txt",
             relative_path="file.txt",
             watch_root="test_root",
@@ -743,16 +781,33 @@ class TestDatabase(unittest.TestCase):
             file_hash="h",
             original_mtime=0.0,
         )
+        self.db.insert_recycle_meta(
+            recycle_path="expired_test/recent_file.txt",
+            original_path="/src/file2.txt",
+            relative_path="file2.txt",
+            watch_root="test_root",
+            is_directory=False,
+            deletion_time=recent_time,
+            deletion_time_str="20990101_000000",
+            file_size=200,
+            file_hash="h2",
+            original_mtime=0.0,
+        )
+        # 删除过期记录（cutoff = 50000 秒前）
         deleted = []
         for batch in self.db.delete_expired_recycle_meta(
             time.time() - 50000, batch_size=100
         ):
             deleted.extend(batch)
-        # 数据库可能有真实数据，只验证测试条目在删除结果中
-        found = any("expired_test" in r.get("recycle_path", "") for r in deleted)
-        self.assertTrue(found, "expired_test 条目未在删除结果中找到")
+        # 验证过期记录被删除
+        found_old = any("expired_test/old_file" in r.get("recycle_path", "")
+                        for r in deleted)
+        self.assertTrue(found_old, "expired_test/old_file 条目未被删除")
+        # 验证未过期记录未被删除
+        recent_meta = self.db.get_recycle_meta("expired_test/recent_file.txt")
+        self.assertIsNotNone(recent_meta, "未过期记录不应被删除")
         # 清理
-        self.db.delete_recycle_meta("expired_test/file.txt")
+        self.db.delete_recycle_meta("expired_test/recent_file.txt")
 
 
 class TestWebAPI(unittest.TestCase):

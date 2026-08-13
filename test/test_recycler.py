@@ -211,9 +211,16 @@ class TestRecyclerBasic(unittest.TestCase):
         recycle_files = list_recycled_files(self.config)
         if recycle_files:
             recycle_full = recycle_files[0].get("recycle_path", "")
-            if os.path.exists(recycle_full):
+            # cleanup_expired 文件模式读取的是 .recycle.json 中的 deletion_time，
+            # 而非文件 mtime，需要修改 JSON 元信息
+            meta_file = recycle_full + ".recycle.json"
+            if os.path.exists(meta_file):
                 old_time = time.time() - 86400 * 2  # 2 天前
-                os.utime(recycle_full, (old_time, old_time))
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                meta["deletion_time"] = old_time
+                with open(meta_file, "w", encoding="utf-8") as f:
+                    json.dump(meta, f)
 
         cleaned = cleanup_expired(self.config, self.logger)
         self.assertGreaterEqual(cleaned, 1)
