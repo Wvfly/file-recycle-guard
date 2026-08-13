@@ -1,8 +1,13 @@
 """Nuitka onefile 构建脚本"""
+import io
 import subprocess
 import sys
 import os
 import shutil
+
+# GitHub Actions Windows runner 默认代码页不是 UTF-8，强制 stdout/stderr 使用 UTF-8
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 

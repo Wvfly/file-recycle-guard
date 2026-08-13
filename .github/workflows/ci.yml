@@ -40,6 +40,9 @@ jobs:
     name: Nuitka 打包 (Windows)
     needs: test
     runs-on: windows-latest
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
