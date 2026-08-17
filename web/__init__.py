@@ -431,6 +431,12 @@ def start_web(config: Config, logger, usn_detector=None):
             app,
             host=config.web.host,
             port=config.web.port,
+            headers=[
+                     # ("Access-Control-Allow-Origin","*"), # 允许跨域
+                     ("server", "srvercat"),  # 混淆框架标记，避免针对攻击
+                     ("X-Powered-By","PHP/5.6.40"), # PHP混淆，误导攻击者
+                     ("x-content-type-options","nosniff")  # 防止XSS攻击
+            ],
             log_level="warning",  # 抑制 uvicorn 默认访问日志，由 access_log_middleware 处理
         ),
         daemon=True,
